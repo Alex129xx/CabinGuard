@@ -141,7 +141,7 @@ async def patch_simulation(session_id: str, patch: SimulationPatch):
     if state.navigation.status == "active" and patch.vehicle:
         raise HTTPException(409, "导航中不能手动修改车辆位置")
     driver = patch.driver.model_dump(mode="json") if patch.driver else state.driver.model_dump(mode="json")
-    result, _, _ = await store.run(session_id, {"event": "proactive", "vehicle": vehicle, "driver": driver})
+    result, _, _ = await store.run(session_id, {"event": "proactive", "vehicle": vehicle, "driver": driver, "event_payload": {}})
     asyncio.create_task(hub.publish(session_id))
     return {"messages": [result.final_response] if result and result.final_response else [], "state": result.model_dump(mode="json") if result else state.model_dump(mode="json")}
 
@@ -156,6 +156,8 @@ async def scenario(session_id: str, scenario_id: str):
         vehicle["ignition_on"] = True; cabin["temperature"] = 26
     elif scenario_id == "fatigue":
         vehicle.update({"ignition_on": True, "speed_kmh": 105}); driver.update({"fatigue_level": .9, "attention_level": .38, "driving_duration_minutes": 145})
+    elif scenario_id == "attention":
+        vehicle.update({"ignition_on": True, "speed_kmh": 60}); driver.update({"fatigue_level": .25, "attention_level": .3, "driving_duration_minutes": 35})
     else:
         raise HTTPException(404, "未知场景")
     result, _, _ = await store.run(session_id, {"event": "proactive", "vehicle": vehicle, "driver": driver, "cabin": cabin, "event_payload": {"scenario_id": scenario_id}})
@@ -174,7 +176,7 @@ async def advance_navigation(session_id: str):
     driver["driving_duration_minutes"] += 1 / 60
     navigation["simulated_speed_kmh"] = speed
     navigation["simulated_elapsed_minutes"] += 1 / 60
-    result, _, _ = await store.run(session_id, {"event": "proactive", "vehicle": vehicle, "driver": driver, "navigation": navigation})
+    result, _, _ = await store.run(session_id, {"event": "proactive", "vehicle": vehicle, "driver": driver, "navigation": navigation, "event_payload": {}})
     asyncio.create_task(hub.publish(session_id))
     return result.model_dump(mode="json") if result else state.model_dump(mode="json")
 

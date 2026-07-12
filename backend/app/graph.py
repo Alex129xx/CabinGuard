@@ -93,10 +93,18 @@ def _weather_arguments(state: CabinGuardState, text: str) -> dict[str, Any]:
 
 def _seat_arguments(state: CabinGuardState, text: str) -> dict[str, Any]:
     cabin = state.get("cabin", {})
-    heating = 2 if "加热" in text else cabin.get("seat_heating", 0)
-    ventilation = 0 if "加热" in text else 2 if "通风" in text else cabin.get("seat_ventilation", 0)
+    if "关闭座椅" in text or "关闭加热" in text or "关闭按摩" in text or "全关" in text:
+        return {"heating": 0, "massage": 0}
+    heating = 1 if "加热" in text and any(word in text for word in ("太烫", "热了", "低一点", "一档")) else 2 if "加热" in text else cabin.get("seat_heating", 0)
     massage = 3 if any(word in text for word in ("最大", "最强", "三档")) else 1 if "按摩" in text else cabin.get("seat_massage", 0)
-    return {"heating": heating, "ventilation": ventilation, "massage": massage}
+    return {"heating": heating, "massage": massage}
+
+
+def _climate_arguments(state: CabinGuardState, text: str) -> dict[str, Any]:
+    if any(word in text for word in ("关闭空调", "关空调", "空调关", "空调关闭")):
+        return {"mode": "off"}
+    match = re.search(r"(\d{1,2})\s*度", text)
+    return {"temperature": int(match.group(1)) if match else state.get("cabin", {}).get("temperature", 23), "mode": "auto"}
 
 
 def router(state: CabinGuardState) -> Command[Literal["candidate", "planner", "safety", "approval", "proactive", "finish"]]:
@@ -113,17 +121,6 @@ def router(state: CabinGuardState) -> Command[Literal["candidate", "planner", "s
         base = {"messages": messages, "agent_status": "understanding", "execution_trace": _trace(state, "input_router", "message")}
         if any(word in text.replace(" ", "") for word in ("取消导航", "结束导航", "停止导航", "不导航了")):
             return Command(goto="safety", update={**base, "planned_calls": [{"name": "stop_navigation", "arguments": {}}], "planner_reply": None, "response_source": "rule"})
-        if any(word in text for word in ("天气", "下雨", "温度")):
-            return Command(goto="safety", update={**base, "planned_calls": [{"name": "get_weather", "arguments": _weather_arguments(state, text)}], "planner_reply": None, "response_source": "rule"})
-        if "座椅" in text and any(word in text for word in ("加热", "通风", "按摩")):
-            return Command(goto="safety", update={**base, "planned_calls": [{"name": "set_seat", "arguments": _seat_arguments(state, text)}], "planner_reply": None, "response_source": "rule"})
-        if "视频" in text or "电影" in text:
-            return Command(goto="safety", update={**base, "planned_calls": [{"name": "set_media", "arguments": {"mode": "video"}}], "planner_reply": None, "response_source": "rule"})
-        if "音乐" in text:
-            return Command(goto="safety", update={**base, "planned_calls": [{"name": "set_media", "arguments": {"mode": "music"}}], "planner_reply": None, "response_source": "rule"})
-        if any(word in text for word in ("带我去", "导航到")):
-            destination = re.sub(r".*?(带我去|导航到)", "", text).strip()
-            return Command(goto="safety", update={**base, "planned_calls": [{"name": "search_poi", "arguments": {"query": destination or "虹桥站"}}], "planner_reply": None, "response_source": "rule"})
         if state.get("navigation", {}).get("status") == "selecting":
             return Command(goto="candidate", update=base)
         return Command(goto="planner", update=base)
@@ -146,7 +143,8 @@ async def _deepseek_plan(state: CabinGuardState, text: str) -> dict[str, Any] | 
     if not settings.llm_enabled:
         return None
     prompt = {
-        "role": "system", "content": "你是 CabinGuard 规划器。只输出 JSON：{intent,reply,tool_calls:[{name,arguments}]}。工具名只能是：" + ",".join(sorted(TOOL_NAMES)) + "。车控和导航必须使用工具。",
+        "role": "system", "content": """你是 CabinGuard 的语义规划器。只输出 JSON：{intent,reply,tool_calls:[{name,arguments}]}。理解自然中文、同义表达、上下文和省略信息；车控、天气和导航必须生成工具调用，不要只用文字承诺。
+工具参数：search_poi {query}；plan_route {destination}；start_navigation {}；stop_navigation {}；get_weather {action: current|destination|location, location?: 地名}；set_temperature {mode: off|auto|cool|heat|fan, temperature?: 整数}；set_seat {heating: 0|1|2|3, massage: 0|1|2|3}（只支持加热和按摩；“太烫/热了/低一点”对应加热 1 档，关闭对应 0）；set_media {mode: music|podcast|video|off, volume?: 0-100}；set_window {open_percent: 0-100}；get_vehicle_status {}；emit_safety_alert {action,level,message}；save_user_preference {key,value}；delete_user_preference {key}。新的导航请求必须先调用 search_poi，等待用户从候选地点中选择后才调用 plan_route，预览路线后才调用 start_navigation。工具名只能是：""" + ",".join(sorted(TOOL_NAMES)),
     }
     context = [prompt, {"role": "system", "content": json.dumps({"vehicle": state.get("vehicle"), "navigation": state.get("navigation"), "preferences": state.get("user_preferences", {})}, ensure_ascii=False)}, {"role": "user", "content": text}]
     started = time.monotonic()
@@ -174,14 +172,15 @@ def _fallback_plan(state: CabinGuardState, text: str) -> dict[str, Any]:
     if any(word in normalized for word in ("结束导航", "取消导航", "停止导航")):
         return {"reply": None, "tool_calls": [{"name": "stop_navigation", "arguments": {}}]}
     if any(word in normalized for word in ("天气", "下雨", "温度")):
-        action = "destination" if state.get("navigation", {}).get("destination") and any(word in normalized for word in ("那里", "目的地", "那边")) else "current"
-        return {"reply": None, "tool_calls": [{"name": "get_weather", "arguments": {"action": action}}]}
+        return {"reply": None, "tool_calls": [{"name": "get_weather", "arguments": _weather_arguments(state, normalized)}]}
     if any(word in normalized for word in ("带我去", "导航到", "去")):
         destination = re.sub(r".*?(带我去|导航到|去)", "", normalized).strip()
         return {"reply": None, "tool_calls": [{"name": "search_poi", "arguments": {"query": destination or "虹桥站"}}]}
     match = re.search(r"(1[89]|2[0-8])\s*度", normalized)
     if match or "空调" in normalized:
-        return {"reply": None, "tool_calls": [{"name": "set_temperature", "arguments": {"temperature": int(match.group(1)) if match else 23, "mode": "auto"}}]}
+        return {"reply": None, "tool_calls": [{"name": "set_temperature", "arguments": _climate_arguments(state, normalized)}]}
+    if "座椅" in normalized and any(word in normalized for word in ("加热", "按摩", "关闭", "关掉", "全关")):
+        return {"reply": None, "tool_calls": [{"name": "set_seat", "arguments": _seat_arguments(state, normalized)}]}
     if "视频" in normalized or "电影" in normalized:
         return {"reply": None, "tool_calls": [{"name": "set_media", "arguments": {"mode": "video"}}]}
     if "音乐" in normalized:
@@ -214,7 +213,7 @@ def safety(state: CabinGuardState) -> dict[str, Any]:
     elif name == "search_poi": legacy_args = {"action": "search", "destination": args.get("query", "")}
     gate = evaluate(aliases.get(name, name), legacy_args, domain, proactive=state.get("event") == "proactive")
     if gate.decision.value == "CONFIRM":
-        action = {"id": f"{state['session_id']}:{len(state.get('tool_logs', []))}", "tool": name, "args": args, "prompt": gate.message, "created_at": now_iso()}
+        action = {"id": f"{state['session_id']}:{len(state.get('tool_logs', []))}", "tool": name, "args": gate.args, "prompt": gate.message, "created_at": now_iso()}
         return {"pending_action": action, "agent_status": "awaiting_confirmation", "execution_trace": _trace(state, "safety_gate", "confirm")}
     if gate.decision.value == "BLOCK":
         return {"planned_calls": [], "planner_reply": gate.message, "execution_trace": _trace(state, "safety_gate", "deny")}
@@ -276,20 +275,27 @@ async def proactive(state: CabinGuardState) -> dict[str, Any]:
     def due(key: str, seconds: int = 600) -> bool:
         return now - float(trigger.get(key, 0)) >= seconds
     scenario = state.get("event_payload", {}).get("scenario_id")
-    if scenario == "rainy":
-        calls.append({"name": "get_weather", "arguments": {"action": "current"}})
-        messages.append("雨天出行场景已加载，正在查询当前位置的真实天气。")
+    if scenario in {"commute", "rainy"}:
+        calls.append({"name": "get_weather", "arguments": {"action": "current", "rainy_scenario": scenario == "rainy"}})
+        messages.append("雨天出行场景已加载，正在查询当前位置的真实天气。" if scenario == "rainy" else "正常通勤场景已加载，正在查询当前位置的真实天气。")
     elif domain.driver.fatigue_level >= .8 and due("fatigue_critical", 60):
         trigger["fatigue_critical"] = now
         calls.append({"name": "emit_safety_alert", "arguments": {"action": "alert", "level": "critical", "message": "检测到明显疲劳风险，请尽快进入休息区休息。"}})
     elif domain.driver.driving_duration_minutes >= 120 and due("rest"):
         trigger["rest"] = now
         calls.append({"name": "emit_safety_alert", "arguments": {"action": "alert", "level": "warning", "message": "您已连续驾驶较长时间，建议尽快休息。"}})
+    elif domain.driver.attention_level <= .4 and due("attention", 300):
+        trigger["attention"] = now
+        message = "检测到注意力较低，请集中注意力并注意前方路况。"
+        if domain.cabin.media_mode in {"music", "podcast"}:
+            calls.append({"name": "set_media", "arguments": {"mode": domain.cabin.media_mode, "volume": min(100, domain.cabin.volume + 10)}})
+            message += " 我可以将当前媒体音量稍微提高。"
+        return {"trigger_state": trigger, "active_alert": message, "planned_calls": calls, "planner_reply": message, "execution_trace": _trace(state, "proactive_evaluator", "attention")}
     elif domain.vehicle.ignition_on and not trigger.get("ignition"):
         trigger["ignition"] = now
         calls.append({"name": "get_weather", "arguments": {"action": "current"}})
         messages.append("车辆已点火，正在检查当前天气和车辆状态。")
-    elif (domain.cabin.temperature >= 27 or domain.cabin.temperature < 18) and due("climate"):
+    elif domain.cabin.climate_mode == "off" and (domain.cabin.temperature > 28 or domain.cabin.temperature < 18) and due("climate"):
         trigger["climate"] = now
         calls.append({"name": "set_temperature", "arguments": {"temperature": 23, "mode": "auto"}})
     return {"trigger_state": trigger, "planned_calls": calls, "planner_reply": " ".join(messages) or None, "execution_trace": _trace(state, "proactive_evaluator", str(len(calls)))}

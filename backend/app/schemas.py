@@ -25,6 +25,7 @@ class VehicleState(BaseModel):
     ignition_on: bool = False
     latitude: float = 31.2304
     longitude: float = 121.4737
+    wiper_on: bool = False
 
 
 class CabinState(BaseModel):

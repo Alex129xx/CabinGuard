@@ -24,19 +24,21 @@ def evaluate(tool: str, args: dict, state: SessionState, proactive: bool = False
         return GateResult(GateDecision.MODIFY, effective, "高速行驶时已将按摩强度调整为低档。")
     if tool == "climate_control" and "temperature" in effective:
         requested = int(effective["temperature"])
-        adjusted = max(18, min(28, requested))
-        if adjusted != requested:
-            effective["temperature"] = adjusted
-            return GateResult(GateDecision.MODIFY, effective, f"温度已调整到安全范围内的 {adjusted}℃。")
+        if requested < 18 or requested > 28:
+            effective.update({"temperature": 23, "mode": "auto"})
+            return GateResult(GateDecision.CONFIRM, effective, f"{requested}℃ 超出舒适范围（18–28℃）。是否为您自动调整到舒适的 23℃？")
     if tool == "navigation_service" and effective.get("action") == "start":
         if state.navigation.destination is None:
             return GateResult(GateDecision.BLOCK, effective, "请先选择明确的目的地。")
         if state.navigation.status != "preview":
             return GateResult(GateDecision.CONFIRM, effective, "路线尚未预览，是否先为您规划路线？")
-    if tool == "navigation_service" and effective.get("action") == "preview" and state.navigation.status == "active":
+    is_actively_navigating = state.navigation.status == "active" and state.navigation.route is not None
+    if tool == "navigation_service" and effective.get("action") == "preview" and is_actively_navigating:
         return GateResult(GateDecision.CONFIRM, effective, "当前正在导航，确定要更换目的地吗？")
-    if tool == "navigation_service" and effective.get("action") == "search" and state.navigation.status == "active":
+    if tool == "navigation_service" and effective.get("action") == "search" and is_actively_navigating:
         return GateResult(GateDecision.CONFIRM, effective, "当前正在导航，确定要更换目的地吗？")
+    if tool == "media_control" and proactive:
+        return GateResult(GateDecision.CONFIRM, effective, "检测到注意力较低，我可以将媒体音量稍微提高，是否确认？")
     if tool in {"climate_control", "media_control", "seat_control"} and proactive:
         return GateResult(GateDecision.CONFIRM, effective, "我可以为您执行这项舒适性调节，是否确认？")
     if driver.fatigue_level >= 0.8 and speed >= 80 and tool == "safety_service":
