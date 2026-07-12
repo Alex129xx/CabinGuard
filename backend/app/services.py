@@ -11,7 +11,19 @@ class AmapServiceError(RuntimeError):
     """A user-safe failure returned by a high-map Web service."""
 
 
+class WeatherServiceError(RuntimeError):
+    """A user-safe weather provider failure."""
+
+
+_weather_cache: dict[tuple[float, float], tuple[float, dict[str, Any]]] = {}
+
+
 async def weather(latitude: float, longitude: float) -> dict[str, Any]:
+    key = (round(latitude, 2), round(longitude, 2))
+    now = datetime.now(timezone.utc).timestamp()
+    cached = _weather_cache.get(key)
+    if cached and now - cached[0] < settings.weather_cache_seconds:
+        return {**cached[1], "cached": True}
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             response = await client.get("https://api.open-meteo.com/v1/forecast", params={
@@ -23,16 +35,20 @@ async def weather(latitude: float, longitude: float) -> dict[str, Any]:
             data = response.json()
         current = data["current"]
         probability = max(data.get("hourly", {}).get("precipitation_probability", [0])[:3], default=0)
-        return {
+        result = {
             "temperature": round(current["temperature_2m"]),
             "apparent_temperature": round(current["apparent_temperature"]),
             "weather": weather_label(current["weather_code"]),
             "precipitation_probability": probability,
             "wind_speed": round(current["wind_speed_10m"]),
             "source": "open-meteo",
+            "cached": False,
+            "fetched_at": now_iso(),
         }
-    except Exception:
-        return {"temperature": 26, "apparent_temperature": 27, "weather": "小雨", "precipitation_probability": 70, "wind_speed": 12, "source": "demo-cache"}
+        _weather_cache[key] = (now, result)
+        return result
+    except Exception as exc:
+        raise WeatherServiceError("当前无法获取天气信息") from exc
 
 
 def weather_label(code: int) -> str:

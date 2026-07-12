@@ -35,6 +35,7 @@ class CabinState(BaseModel):
     seat_heating: int = Field(default=0, ge=0, le=3)
     seat_ventilation: int = Field(default=0, ge=0, le=3)
     seat_massage: int = Field(default=0, ge=0, le=3)
+    window_open_percent: int = Field(default=0, ge=0, le=100)
 
 
 class NavigationState(BaseModel):
@@ -53,6 +54,7 @@ class PendingAction(BaseModel):
     tool: str
     args: dict[str, Any]
     prompt: str
+    created_at: str | None = None
 
 
 class ToolLog(BaseModel):
@@ -65,6 +67,7 @@ class ToolLog(BaseModel):
 
 class SessionState(BaseModel):
     session_id: str
+    profile_id: str | None = None
     vehicle: VehicleState = Field(default_factory=VehicleState)
     driver: DriverState = Field(default_factory=DriverState)
     cabin: CabinState = Field(default_factory=CabinState)
@@ -74,12 +77,28 @@ class SessionState(BaseModel):
     tool_logs: list[ToolLog] = Field(default_factory=list)
     active_alert: str | None = None
     weather: dict[str, Any] | None = None
+    trigger_state: dict[str, Any] = Field(default_factory=dict)
+    provider_status: dict[str, Any] = Field(default_factory=dict)
+    execution_trace: list[dict[str, Any]] = Field(default_factory=list)
+    agent_status: str = "idle"
+    final_response: str | None = None
+    response_source: str | None = None
 
 
 class MessageIn(BaseModel):
-    text: str = Field(min_length=1, max_length=1000)
+    text: str = Field(default="", max_length=1000)
+    candidate_id: str | None = None
 
 
 class SimulationPatch(BaseModel):
     vehicle: VehicleState | None = None
     driver: DriverState | None = None
+
+
+class SessionCreateIn(BaseModel):
+    profile_id: str | None = Field(default=None, max_length=128)
+
+
+class ResumeIn(BaseModel):
+    action_id: str
+    approved: bool

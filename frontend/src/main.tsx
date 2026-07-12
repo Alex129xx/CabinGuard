@@ -64,9 +64,7 @@ function App() {
   const [status, setStatus] = useState('正在连接');
   const [startupError, setStartupError] = useState('');
   const [recording, setRecording] = useState(false);
-  const recorder = useRef<MediaRecorder | null>(null);
   const recognition = useRef<any>(null);
-  const chunks = useRef<Blob[]>([]);
   const advancing = useRef(false);
 
   const setParkPosition = async (longitude: number, latitude: number) => {
@@ -79,13 +77,13 @@ function App() {
     } catch (error) { setStatus(`设置位置失败：${error instanceof Error ? error.message : '未知错误'}`); }
   };
 
-  const send = async (text: string) => {
+  const send = async (text: string, candidate_id?: string) => {
     if (!state || !text.trim()) return;
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 20_000);
     try {
       setStatus('Agent 正在处理');
-      const r = await fetch(`${API}/api/sessions/${state.session_id}/messages`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text}), signal: controller.signal});
+      const r = await fetch(`${API}/api/sessions/${state.session_id}/messages`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text, candidate_id}), signal: controller.signal});
       const data = await r.json();
       if (!r.ok) throw new Error(data.detail || 'Agent 请求失败');
       setState(data.state); setInput(''); setStatus('等待指令');
@@ -94,6 +92,20 @@ function App() {
       const message = error instanceof DOMException && error.name === 'AbortError' ? 'Agent 响应超时，请检查后端或 DeepSeek 网络' : error instanceof Error ? error.message : '请检查后端服务';
       setStatus(`发送失败：${message}`);
     } finally { window.clearTimeout(timeout); }
+  };
+
+  const resume = async (approved: boolean) => {
+    if (!state?.pending_action) return;
+    const r = await fetch(`${API}/api/sessions/${state.session_id}/resume`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action_id: state.pending_action.id, approved})});
+    const data = await r.json(); if (!r.ok) { setStatus(data.detail || '确认操作失败'); return; }
+    setState(data.state); setStatus(data.response || '等待指令'); if (VOICE_ENABLED && data.response) void speak(data.response);
+  };
+
+  const resetDemo = async () => {
+    if (!state) return;
+    const r = await fetch(`${API}/api/sessions/${state.session_id}/reset`, {method: 'POST'}); const data = await r.json();
+    if (!r.ok) { setStatus(data.detail || '重置失败'); return; }
+    setState(data); setStatus('演示已重新开始');
   };
 
   const scenario = async (id: string) => {
@@ -135,31 +147,11 @@ function App() {
       catch (error) { setStatus(`麦克风不可用：${error instanceof Error ? error.message : '请检查浏览器权限'}`); }
       return;
     }
-    try {
-      if (!navigator.mediaDevices?.getUserMedia) throw new Error('当前浏览器不支持麦克风录音');
-      const stream = await navigator.mediaDevices.getUserMedia({audio: true});
-      chunks.current = [];
-      recorder.current = new MediaRecorder(stream);
-      recorder.current.ondataavailable = e => chunks.current.push(e.data);
-      recorder.current.onstop = async () => {
-        try {
-          stream.getTracks().forEach(t => t.stop());
-          if (!chunks.current.length) throw new Error('没有录到音频，请检查麦克风权限');
-          const blob = await toWav(new Blob(chunks.current, {type: recorder.current?.mimeType || 'audio/webm'}));
-          setStatus('正在识别');
-          const form = new FormData(); form.append('audio', blob, 'recording.wav');
-          const r = await fetch(`${API}/api/speech/transcribe`, {method: 'POST', body: form}); const data = await r.json();
-          if (!r.ok) throw new Error(data.detail || '语音识别请求失败');
-          if (data.text) { setInput(data.text); await send(data.text); }
-          else { setStatus(data.error || '未识别到语音，请重试或使用键盘输入'); }
-        } catch (error) { setStatus(`语音不可用：${error instanceof Error ? error.message : '请使用键盘输入'}`); }
-      };
-      recorder.current.start(); setRecording(true); setStatus('正在录音');
-    } catch (error) { setStatus(`麦克风不可用：${error instanceof Error ? error.message : '请检查浏览器权限'}`); }
+    setStatus('当前浏览器不支持原生语音识别，请使用键盘输入');
   };
   const stopRecording = () => {
     if (recognition.current) recognition.current.stop();
-    else recorder.current?.stop();
+    else setStatus('语音识别已停止');
     setRecording(false);
   };
 
@@ -168,9 +160,14 @@ function App() {
     const timeout = window.setTimeout(() => controller.abort(), 8_000);
     (async () => {
       try {
-        const r = await fetch(`${API}/api/sessions`, {method: 'POST', signal: controller.signal});
-        const s = await r.json();
-        if (!r.ok) throw new Error(s.detail || '创建会话失败');
+        const profile_id = localStorage.getItem('cabinguard.profile_id') || crypto.randomUUID();
+        localStorage.setItem('cabinguard.profile_id', profile_id);
+        const previous = localStorage.getItem('cabinguard.session_id');
+        let r = previous ? await fetch(`${API}/api/sessions/${previous}/state`, {signal: controller.signal}) : null;
+        let s = r?.ok ? await r.json() : null;
+        if (!s) { r = await fetch(`${API}/api/sessions`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({profile_id}), signal: controller.signal}); s = await r.json(); }
+        if (!r?.ok) throw new Error(s.detail || '创建会话失败');
+        localStorage.setItem('cabinguard.session_id', s.session_id);
         setState(s); setStatus('等待指令');
       } catch (error) {
         const message = error instanceof DOMException && error.name === 'AbortError' ? '连接后端超时' : error instanceof Error ? error.message : '无法连接后端';
@@ -201,7 +198,7 @@ function App() {
   if (!state) return <main className="loading"><div><b>CabinGuard 正在启动…</b>{startupError && <p>启动失败：{startupError}</p>}</div></main>;
   const route = state.navigation.route;
   return <main className="app-shell">
-    <header><div><span className="eyebrow">CABINGUARD V2</span><h1>主动式智能座舱</h1></div><div className="status"><i />{status}</div></header>
+    <header><div><span className="eyebrow">CABINGUARD V3</span><h1>主动式智能座舱</h1></div><div className="status"><i />{state.agent_status || status}</div><button onClick={resetDemo}>重新开始演示</button></header>
     <section className="layout">
       <aside className="panel simulator"><h2>车辆与驾驶员</h2><Metric label="车速" value={`${state.vehicle.speed_kmh.toFixed(1)} km/h`} /><Metric label="驾驶时长" value={formatDuration(state.driver.driving_duration_minutes)} />
         <label>疲劳程度 <output>{Math.round(state.driver.fatigue_level * 100)}%</output><input type="range" min="0" max="1" step=".01" value={state.driver.fatigue_level} onChange={e => updateDriver('fatigue_level', +e.target.value)} /></label>
@@ -212,7 +209,7 @@ function App() {
         <div className="cabin-cards"><Card icon="♨" label="空调" value={`${state.cabin.temperature}℃ · ${state.cabin.climate_mode}`} /><Card icon="♫" label="媒体" value={`${state.cabin.media_mode} · ${state.cabin.volume}%`} /><Card icon="▧" label="座椅" value={`通风 ${state.cabin.seat_ventilation} · 按摩 ${state.cabin.seat_massage}`} />{state.weather && <Card icon="☂" label="天气" value={`${state.weather.temperature}℃ · ${state.weather.weather}`} />}</div>
         {state.active_alert && <div className="alert">⚠ {state.active_alert}</div>}
       </section>
-      <aside className="panel agent"><h2>Agent 决策面板</h2><div className="history">{state.messages.map((m: any, i: number) => <div key={i} className={m.role}><small>{m.role === 'user' ? '你' : 'CabinGuard'}</small>{m.content}</div>)}</div>{state.pending_action && <div className="confirm"><b>需要确认</b><p>{state.pending_action.prompt}</p><button onClick={() => send('确认')}>确认执行</button><button onClick={() => send('取消')}>取消</button></div>}<h3>工具与安全日志</h3><div className="logs">{state.tool_logs.map((log: any, i: number) => <div key={i}><b className={log.decision}>{log.decision}</b><span>{log.tool}</span><small>{log.message}</small></div>)}</div></aside>
+      <aside className="panel agent"><h2>Agent 决策面板</h2><div className="history">{state.messages.map((m: any, i: number) => <div key={i} className={m.role}><small>{m.role === 'user' ? '你' : 'CabinGuard'}</small>{m.content}</div>)}</div>{state.navigation.candidates?.length > 0 && state.navigation.status === 'selecting' && <div className="confirm"><b>选择目的地</b>{state.navigation.candidates.map((p: any) => <button key={p.id} onClick={() => send(p.name, p.id)}>{p.name}<small>{p.address}</small></button>)}</div>}{state.pending_action && <div className="confirm"><b>需要确认</b><p>{state.pending_action.prompt}</p><button onClick={() => resume(true)}>确认执行</button><button onClick={() => resume(false)}>取消</button></div>}<h3>工具与安全日志</h3><div className="logs">{state.tool_logs.map((log: any, i: number) => <div key={i}><b className={log.decision}>{log.decision}</b><span>{log.tool}</span><small>{log.message}</small></div>)}</div><details><summary>Agent 执行轨迹</summary>{state.execution_trace?.map((item: any, i: number) => <div key={i}><small>{item.node} · {item.detail}</small></div>)}</details></aside>
     </section>
     <footer>{VOICE_ENABLED ? <><button className={recording ? 'recording' : ''} onClick={recording ? stopRecording : startRecording}>{recording ? '■ 停止录音' : '● 开始说话'}</button><button onClick={() => speechSynthesis.cancel()}>停止播报</button></> : <span className="text-mode">纯文字模式：语音输入与播报已暂时关闭</span>}<form onSubmit={e => { e.preventDefault(); send(input); }}><input value={input} onChange={e => setInput(e.target.value)} placeholder="例如：带我去虹桥站，顺便看看天气"/><button>发送</button></form></footer>
   </main>;
@@ -224,5 +221,4 @@ async function speak(text: string) {
   speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text); utterance.lang = 'zh-CN'; utterance.rate = .95; speechSynthesis.speak(utterance);
 }
-async function toWav(blob: Blob): Promise<Blob> { const ctx = new AudioContext(); const buffer = await ctx.decodeAudioData(await blob.arrayBuffer()); const samples = buffer.getChannelData(0); const target = 16000; const ratio = buffer.sampleRate / target; const out = new Int16Array(Math.ceil(samples.length / ratio)); for (let i = 0; i < out.length; i++) out[i] = Math.max(-1, Math.min(1, samples[Math.floor(i * ratio)])) * 0x7fff; const header = new ArrayBuffer(44); const view = new DataView(header); const put = (o: number, s: string) => [...s].forEach((c, i) => view.setUint8(o + i, c.charCodeAt(0))); put(0,'RIFF'); view.setUint32(4, 36 + out.byteLength, true); put(8,'WAVE'); put(12,'fmt '); view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,1,true); view.setUint32(24,target,true); view.setUint32(28,target*2,true); view.setUint16(32,2,true); view.setUint16(34,16,true); put(36,'data'); view.setUint32(40,out.byteLength,true); ctx.close(); return new Blob([header,out], {type:'audio/wav'}); }
 createRoot(document.getElementById('root')!).render(<App />);

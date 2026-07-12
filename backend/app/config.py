@@ -15,10 +15,7 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-v4-flash"
     deepseek_use_env_proxy: bool = False
     amap_web_service_key: str | None = None
-    azure_speech_key: str | None = None
-    azure_speech_region: str | None = None
-    azure_speech_endpoint: str | None = None
-    azure_speech_enabled: bool = False
+    weather_cache_seconds: int = 600
 
     @property
     def llm_enabled(self) -> bool:
@@ -27,10 +24,5 @@ class Settings(BaseSettings):
     @property
     def amap_enabled(self) -> bool:
         return bool(self.amap_web_service_key)
-
-    @property
-    def azure_enabled(self) -> bool:
-        return bool(self.azure_speech_enabled and self.azure_speech_key and (self.azure_speech_region or self.azure_speech_endpoint))
-
 
 settings = Settings()
