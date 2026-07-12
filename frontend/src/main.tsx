@@ -39,9 +39,13 @@ function App() {
 
   const send = async (text: string) => {
     if (!state || !text.trim()) return;
-    setStatus('Agent 正在处理');
-    const r = await fetch(`${API}/api/sessions/${state.session_id}/messages`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text})});
-    const data = await r.json(); setState(data.state); setInput(''); setStatus('正在播报'); speak(data.response); setTimeout(() => setStatus('等待指令'), 600);
+    try {
+      setStatus('Agent 正在处理');
+      const r = await fetch(`${API}/api/sessions/${state.session_id}/messages`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text})});
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.detail || 'Agent 请求失败');
+      setState(data.state); setInput(''); setStatus('正在播报'); void speak(data.response); setTimeout(() => setStatus('等待指令'), 600);
+    } catch (error) { setStatus(`发送失败：${error instanceof Error ? error.message : '请检查后端服务'}`); }
   };
 
   const scenario = async (id: string) => {
@@ -59,20 +63,26 @@ function App() {
 
   const startRecording = async () => {
     try {
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error('当前浏览器不支持麦克风录音');
       const stream = await navigator.mediaDevices.getUserMedia({audio: true});
       chunks.current = [];
       recorder.current = new MediaRecorder(stream);
       recorder.current.ondataavailable = e => chunks.current.push(e.data);
       recorder.current.onstop = async () => {
-        stream.getTracks().forEach(t => t.stop());
-        const blob = await toWav(new Blob(chunks.current, {type: recorder.current?.mimeType || 'audio/webm'}));
-        setStatus('正在识别');
-        const form = new FormData(); form.append('audio', blob, 'recording.wav');
-        const r = await fetch(`${API}/api/speech/transcribe`, {method: 'POST', body: form}); const data = await r.json();
-        if (data.text) { setInput(data.text); await send(data.text); } else { setStatus(data.error || '识别失败，请用键盘输入'); }
+        try {
+          stream.getTracks().forEach(t => t.stop());
+          if (!chunks.current.length) throw new Error('没有录到音频，请检查麦克风权限');
+          const blob = await toWav(new Blob(chunks.current, {type: recorder.current?.mimeType || 'audio/webm'}));
+          setStatus('正在识别');
+          const form = new FormData(); form.append('audio', blob, 'recording.wav');
+          const r = await fetch(`${API}/api/speech/transcribe`, {method: 'POST', body: form}); const data = await r.json();
+          if (!r.ok) throw new Error(data.detail || '语音识别请求失败');
+          if (data.text) { setInput(data.text); await send(data.text); }
+          else { setStatus(data.error || '未识别到语音，请重试或使用键盘输入'); }
+        } catch (error) { setStatus(`语音不可用：${error instanceof Error ? error.message : '请使用键盘输入'}`); }
       };
       recorder.current.start(); setRecording(true); setStatus('正在录音');
-    } catch { setStatus('麦克风不可用，请检查浏览器权限'); }
+    } catch (error) { setStatus(`麦克风不可用：${error instanceof Error ? error.message : '请检查浏览器权限'}`); }
   };
   const stopRecording = () => { recorder.current?.stop(); setRecording(false); };
 

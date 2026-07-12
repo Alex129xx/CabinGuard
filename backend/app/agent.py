@@ -21,6 +21,36 @@ TOOLS = [
 SYSTEM_PROMPT = """你是 CabinGuard 智能座舱助手。使用中文，回答简洁。需要外部数据或车控时必须调用工具；绝不绕过 Safety Gate。导航目的地有歧义时先搜索，不要自行猜测。"""
 
 
+def normalize_place(value: str) -> str:
+    """Normalize POI names so users can omit punctuation or branch decorations."""
+    value = value.strip().lower().replace("（", "(").replace("）", ")")
+    value = re.sub(r"\s+", "", value)
+    return value
+
+
+def select_candidate(candidates: list[dict], text: str) -> dict | None:
+    normalized = normalize_place(text)
+    ordinal = re.search(r"(?:第)?([123])(?:个|号)?", normalized)
+    if ordinal:
+        index = int(ordinal.group(1)) - 1
+        if index < len(candidates):
+            return candidates[index]
+    for candidate in candidates:
+        name = normalize_place(candidate["name"])
+        if normalized == name:
+            return candidate
+    for candidate in candidates:
+        name = normalize_place(candidate["name"])
+        if normalized in name or name in normalized:
+            return candidate
+    return None
+
+
+def candidate_prompt(candidates: list[dict]) -> str:
+    options = "、".join(f"{index + 1}. {candidate['name']}" for index, candidate in enumerate(candidates[:3]))
+    return f"我还不能确认具体目的地。请回复地点全名或序号：{options}。"
+
+
 async def handle_message(state: SessionState, text: str) -> str:
     state.messages.append({"role": "user", "content": text})
     if state.pending_action:
@@ -33,10 +63,11 @@ async def handle_message(state: SessionState, text: str) -> str:
 
     # Candidate selection should remain deterministic to make the demo stable.
     if state.navigation.status == "selecting" and state.navigation.candidates:
-        selected = next((p for p in state.navigation.candidates if any(token in p["name"] for token in (text, "火车站" if "火车" in text else "__"))), None)
+        selected = select_candidate(state.navigation.candidates, text)
         if selected:
             response = await execute_tool(state, "navigation_service", {"action": "preview", "destination": selected})
             return remember(state, response)
+        return remember(state, candidate_prompt(state.navigation.candidates))
 
     response = await try_llm_tools(state, text) if settings.llm_enabled else None
     if not response:
