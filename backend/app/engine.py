@@ -3,7 +3,7 @@ from __future__ import annotations
 from uuid import uuid4
 from .safety import evaluate
 from .schemas import GateDecision, PendingAction, SessionState, ToolLog
-from .services import demo_route, now_iso, search_poi, weather
+from .services import AmapServiceError, driving_route, now_iso, search_poi, weather
 
 
 async def execute_tool(state: SessionState, tool: str, args: dict, proactive: bool = False, skip_gate: bool = False) -> str:
@@ -26,7 +26,12 @@ async def execute_tool(state: SessionState, tool: str, args: dict, proactive: bo
     if tool == "navigation_service":
         action = effective.get("action")
         if action == "search":
-            state.navigation.candidates = await search_poi(effective.get("destination", ""))
+            try:
+                state.navigation.candidates = await search_poi(effective.get("destination", ""))
+            except AmapServiceError as exc:
+                return str(exc)
+            if not state.navigation.candidates:
+                return "高德未找到匹配地点，请换一个更完整的地点名称。"
             state.navigation.status = "selecting"
             names = "、".join(p["name"] for p in state.navigation.candidates[:3])
             return f"我找到了：{names}。请告诉我您要去哪里。"
@@ -36,16 +41,26 @@ async def execute_tool(state: SessionState, tool: str, args: dict, proactive: bo
                 destination = next((p for p in state.navigation.candidates if destination in p["name"]), state.navigation.candidates[0] if state.navigation.candidates else None)
             if not destination:
                 return "请先告诉我目的地。"
+            try:
+                route = await driving_route(state.vehicle.longitude, state.vehicle.latitude, destination)
+            except AmapServiceError as exc:
+                return str(exc)
             state.navigation.destination = destination
-            state.navigation.route = demo_route(state, destination)
+            state.navigation.route = route
             state.navigation.status = "preview"
-            route = state.navigation.route
+            state.navigation.progress = 0
+            state.navigation.remaining_distance_km = route["distance_km"]
+            state.navigation.simulated_speed_kmh = 0
+            state.navigation.simulated_elapsed_minutes = 0
             return f"已找到{destination['name']}，全程约 {route['distance_km']} 公里，预计 {route['duration_minutes']} 分钟。现在开始导航吗？"
         if action == "start":
             state.navigation.status = "active"
+            state.vehicle.speed_kmh = 0
             return f"导航已开始，预计 {state.navigation.route['duration_minutes']} 分钟到达。"
         if action == "cancel":
             state.navigation.status = "idle"; state.navigation.route = None; state.navigation.destination = None
+            state.navigation.progress = 0; state.navigation.remaining_distance_km = 0; state.navigation.simulated_speed_kmh = 0; state.navigation.simulated_elapsed_minutes = 0
+            state.vehicle.speed_kmh = 0; state.driver.driving_duration_minutes = 0
             return "已取消导航。"
     if tool == "climate_control":
         state.cabin.temperature = int(effective.get("temperature", state.cabin.temperature)); state.cabin.climate_mode = effective.get("mode", state.cabin.climate_mode)

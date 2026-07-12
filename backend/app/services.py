@@ -5,14 +5,10 @@ from typing import Any
 import httpx
 
 from .config import settings
-from .schemas import SessionState
 
 
-DEMO_POIS = [
-    {"name": "上海虹桥火车站", "address": "上海市闵行区申贵路1500号", "lat": 31.1942, "lng": 121.3217},
-    {"name": "上海虹桥机场 T2", "address": "上海市闵行区申达一路", "lat": 31.1978, "lng": 121.3380},
-    {"name": "杭州西湖", "address": "杭州市西湖区", "lat": 30.2310, "lng": 120.1480},
-]
+class AmapServiceError(RuntimeError):
+    """A user-safe failure returned by a high-map Web service."""
 
 
 async def weather(latitude: float, longitude: float) -> dict[str, Any]:
@@ -50,23 +46,70 @@ def weather_label(code: int) -> str:
 
 
 async def search_poi(query: str) -> list[dict[str, Any]]:
-    if settings.amap_enabled:
-        try:
-            async with httpx.AsyncClient(timeout=3) as client:
-                response = await client.get("https://restapi.amap.com/v5/place/text", params={"key": settings.amap_web_service_key, "keywords": query, "city": "上海", "show_fields": "business"})
-                data = response.json()
-                pois = data.get("pois", [])
-                if pois:
-                    return [{"name": p.get("name"), "address": p.get("address"), "lat": float(p["location"].split(",")[1]), "lng": float(p["location"].split(",")[0])} for p in pois[:5] if p.get("location")]
-        except Exception:
-            pass
-    q = query.replace("站", "")
-    return [poi for poi in DEMO_POIS if q in poi["name"] or query in poi["name"]] or DEMO_POIS[:2]
+    if not settings.amap_enabled:
+        raise AmapServiceError("未配置高德 Web 服务 Key")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(6, connect=3), trust_env=False) as client:
+            response = await client.get("https://restapi.amap.com/v5/place/text", params={
+                "key": settings.amap_web_service_key, "keywords": query, "city": "上海", "show_fields": "business",
+            })
+            response.raise_for_status()
+            data = response.json()
+    except httpx.HTTPError as exc:
+        raise AmapServiceError("高德地点搜索网络不可用") from exc
+    if data.get("status") != "1":
+        raise AmapServiceError(f"高德地点搜索失败：{data.get('info', '未知错误')}")
+    pois = [poi for poi in data.get("pois", []) if poi.get("location")]
+    if not pois:
+        return []
+    return [{
+        "name": poi.get("name", "未命名地点"), "address": poi.get("address") or "",
+        "lat": float(poi["location"].split(",")[1]), "lng": float(poi["location"].split(",")[0]),
+        "id": poi.get("id"), "typecode": poi.get("typecode"),
+    } for poi in pois[:5]]
 
 
-def demo_route(state: SessionState, destination: dict[str, Any]) -> dict[str, Any]:
-    km = round(abs(destination["lat"] - state.vehicle.latitude) * 111 + abs(destination["lng"] - state.vehicle.longitude) * 92, 1)
-    return {"distance_km": max(km, 3.2), "duration_minutes": max(int(km * 1.4), 18), "steps": ["沿当前道路直行", "前方路口右转", "到达目的地"], "polyline": [[state.vehicle.longitude, state.vehicle.latitude], [destination["lng"], destination["lat"]],], "source": "demo"}
+async def driving_route(origin_lng: float, origin_lat: float, destination: dict[str, Any]) -> dict[str, Any]:
+    if not settings.amap_enabled:
+        raise AmapServiceError("未配置高德 Web 服务 Key")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8, connect=3), trust_env=False) as client:
+            response = await client.get("https://restapi.amap.com/v5/direction/driving", params={
+                "key": settings.amap_web_service_key,
+                "origin": f"{origin_lng:.6f},{origin_lat:.6f}",
+                "destination": f"{destination['lng']:.6f},{destination['lat']:.6f}",
+                "destination_id": destination.get("id") or "",
+                "strategy": 32,
+                "show_fields": "cost,navi,polyline",
+            })
+            response.raise_for_status()
+            data = response.json()
+    except httpx.HTTPError as exc:
+        raise AmapServiceError("高德驾车路径规划网络不可用") from exc
+    if data.get("status") != "1":
+        raise AmapServiceError(f"高德路径规划失败：{data.get('info', '未知错误')}")
+    paths = data.get("route", {}).get("paths", [])
+    if not paths:
+        raise AmapServiceError("高德未返回可用驾车路线")
+    path = paths[0]
+    duration_seconds = int(path.get("cost", {}).get("duration") or path.get("duration") or 0)
+    distance_meters = int(path.get("distance") or 0)
+    steps = path.get("steps", [])
+    instructions = [step.get("instruction") or "沿规划路线行驶" for step in steps[:8]]
+    polyline: list[list[float]] = []
+    for step in steps:
+        for point in (step.get("polyline") or "").split(";"):
+            if not point:
+                continue
+            lng, lat = point.split(",")
+            polyline.append([float(lng), float(lat)])
+    return {
+        "distance_km": round(distance_meters / 1000, 1),
+        "duration_minutes": max(1, round(duration_seconds / 60)),
+        "steps": instructions or ["沿规划路线行驶"],
+        "polyline": polyline or [[origin_lng, origin_lat], [destination["lng"], destination["lat"]]],
+        "source": "amap-web-service",
+    }
 
 
 def now_iso() -> str:

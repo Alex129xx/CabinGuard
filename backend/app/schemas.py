@@ -17,7 +17,7 @@ class DriverState(BaseModel):
     attention_level: float = Field(default=0.9, ge=0, le=1)
     stress_level: float = Field(default=0.2, ge=0, le=1)
     mood: str = "normal"
-    driving_duration_minutes: int = Field(default=0, ge=0)
+    driving_duration_minutes: float = Field(default=0, ge=0)
 
 
 class VehicleState(BaseModel):
@@ -43,6 +43,9 @@ class NavigationState(BaseModel):
     destination: dict[str, Any] | None = None
     route: dict[str, Any] | None = None
     progress: float = Field(default=0, ge=0, le=1)
+    remaining_distance_km: float = Field(default=0, ge=0)
+    simulated_speed_kmh: float = Field(default=0, ge=0)
+    simulated_elapsed_minutes: float = Field(default=0, ge=0)
 
 
 class PendingAction(BaseModel):
@@ -80,4 +83,3 @@ class MessageIn(BaseModel):
 class SimulationPatch(BaseModel):
     vehicle: VehicleState | None = None
     driver: DriverState | None = None
-
