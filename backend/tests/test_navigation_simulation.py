@@ -11,14 +11,14 @@ def test_position_on_route_interpolates_between_points():
 
 
 @pytest.mark.asyncio
-async def test_navigation_advances_in_real_time_and_stops_at_destination():
+async def test_navigation_updates_instruments_without_moving_map_position():
     state = store.create()
     state.navigation.status = "active"
     state.navigation.route = {"distance_km": 0.001, "polyline": [[121.0, 31.0], [121.01, 31.0]]}
     state.navigation.remaining_distance_km = 0.001
+    initial_position = (state.vehicle.longitude, state.vehicle.latitude)
     result = await advance_navigation(state.session_id)
-    assert result["navigation"]["status"] == "idle"
-    assert result["navigation"]["route"] is None
-    assert result["navigation"]["destination"] is None
-    assert result["vehicle"]["speed_kmh"] == 0
-    assert result["driver"]["driving_duration_minutes"] == 0
+    assert result["navigation"]["status"] == "active"
+    assert 56 <= result["vehicle"]["speed_kmh"] <= 64
+    assert result["driver"]["driving_duration_minutes"] == pytest.approx(1 / 60)
+    assert (result["vehicle"]["longitude"], result["vehicle"]["latitude"]) == initial_position

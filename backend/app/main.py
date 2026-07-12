@@ -160,30 +160,10 @@ async def advance_navigation(session_id: str):
         raise HTTPException(400, "当前导航没有可用路线")
     simulated_seconds = 1
     speed = round(random.uniform(56, 64), 1)
-    moved_km = speed * simulated_seconds / 3600
-    total_km = state.navigation.route["distance_km"]
-    remaining_km = max(0, state.navigation.remaining_distance_km - moved_km)
     state.vehicle.speed_kmh = speed
     state.driver.driving_duration_minutes += simulated_seconds / 60
     state.navigation.simulated_speed_kmh = speed
     state.navigation.simulated_elapsed_minutes += simulated_seconds / 60
-    state.navigation.remaining_distance_km = round(remaining_km, 1)
-    state.navigation.progress = min(1, 1 - remaining_km / total_km) if total_km else 1
-    longitude, latitude = position_on_route(state.navigation.route.get("polyline", []), state.navigation.progress)
-    state.vehicle.longitude = longitude
-    state.vehicle.latitude = latitude
-    if remaining_km <= 0:
-        state.navigation.status = "idle"
-        state.vehicle.speed_kmh = 0
-        state.driver.driving_duration_minutes = 0
-        state.navigation.simulated_speed_kmh = 0
-        state.navigation.route = None
-        state.navigation.destination = None
-        state.navigation.candidates = []
-        state.navigation.progress = 0
-        state.navigation.remaining_distance_km = 0
-        state.navigation.simulated_elapsed_minutes = 0
-        state.active_alert = "已到达目的地，车辆已停车，本次驾驶时长已清零。"
     asyncio.create_task(hub.publish(session_id))
     return state.model_dump(mode="json")
 

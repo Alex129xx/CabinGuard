@@ -67,6 +67,7 @@ function App() {
   const recorder = useRef<MediaRecorder | null>(null);
   const recognition = useRef<any>(null);
   const chunks = useRef<Blob[]>([]);
+  const advancing = useRef(false);
 
   const setParkPosition = async (longitude: number, latitude: number) => {
     if (!state || state.navigation.status !== 'idle' || state.vehicle.speed_kmh !== 0) return;
@@ -179,6 +180,24 @@ function App() {
     return () => { controller.abort(); window.clearTimeout(timeout); };
   }, []);
 
+  useEffect(() => {
+    if (!state || state.navigation.status !== 'active') return;
+    const tick = async () => {
+      if (advancing.current) return;
+      advancing.current = true;
+      try {
+        const response = await fetch(`${API}/api/sessions/${state.session_id}/navigation/advance`, {method: 'POST'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || '仪表模拟失败');
+        setState(data);
+      } catch (error) { setStatus(`仪表模拟失败：${error instanceof Error ? error.message : '未知错误'}`); }
+      finally { advancing.current = false; }
+    };
+    void tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [state?.session_id, state?.navigation.status]);
+
   if (!state) return <main className="loading"><div><b>CabinGuard 正在启动…</b>{startupError && <p>启动失败：{startupError}</p>}</div></main>;
   const route = state.navigation.route;
   return <main className="app-shell">
@@ -189,7 +208,7 @@ function App() {
         <label>注意力 <output>{Math.round(state.driver.attention_level * 100)}%</output><input type="range" min="0" max="1" step=".01" value={state.driver.attention_level} onChange={e => updateDriver('attention_level', +e.target.value)} /></label>
         <div className="scenario-grid"><button onClick={() => scenario('commute')}>正常通勤</button><button onClick={() => scenario('rainy')}>雨天出行</button><button className="danger" onClick={() => scenario('fatigue')}>疲劳驾驶</button></div>
       </aside>
-      <section className="center"><div className="map panel"><AmapRoute state={state} onParkPosition={setParkPosition}/><div className="map-top"><span>当前路线</span><b>{state.navigation.status === 'active' ? '导航已开始' : '停车状态：点击地图设置位置'}</b></div>{!import.meta.env.VITE_AMAP_JS_KEY && <div className="road"><span className="pin start">●</span><div className="route-line" style={{width: route ? '100%' : '0%'}} /><span className="car" style={{left: '8%'}}>▰</span><span className="pin end">★</span></div>}{route ? <div className="route-info"><b>{route.distance_km} km</b><span>预计 {route.duration_minutes} 分钟</span>{state.navigation.status !== 'idle' && <button onClick={cancelNavigation}>结束导航并清除路线</button>}</div> : <p>停车时可点击地图设置车辆位置，然后说“带我去虹桥站”</p>}</div>
+      <section className="center"><div className="map panel"><AmapRoute state={state} onParkPosition={setParkPosition}/><div className="map-top"><span>当前路线</span><b>{state.navigation.status === 'active' ? `导航中 · ${state.navigation.simulated_speed_kmh.toFixed(1)} km/h` : '停车状态：点击地图设置位置'}</b></div>{!import.meta.env.VITE_AMAP_JS_KEY && <div className="road"><span className="pin start">●</span><div className="route-line" style={{width: route ? '100%' : '0%'}} /><span className="car" style={{left: '8%'}}>▰</span><span className="pin end">★</span></div>}{route ? <div className="route-info"><b>{route.distance_km} km</b><span>预计 {route.duration_minutes} 分钟</span>{state.navigation.status !== 'idle' && <button onClick={cancelNavigation}>结束导航并清除路线</button>}</div> : <p>停车时可点击地图设置车辆位置，然后说“带我去虹桥站”</p>}</div>
         <div className="cabin-cards"><Card icon="♨" label="空调" value={`${state.cabin.temperature}℃ · ${state.cabin.climate_mode}`} /><Card icon="♫" label="媒体" value={`${state.cabin.media_mode} · ${state.cabin.volume}%`} /><Card icon="▧" label="座椅" value={`通风 ${state.cabin.seat_ventilation} · 按摩 ${state.cabin.seat_massage}`} />{state.weather && <Card icon="☂" label="天气" value={`${state.weather.temperature}℃ · ${state.weather.weather}`} />}</div>
         {state.active_alert && <div className="alert">⚠ {state.active_alert}</div>}
       </section>
