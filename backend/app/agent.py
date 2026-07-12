@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from difflib import SequenceMatcher
 import httpx
 
 from .config import settings
@@ -26,31 +27,83 @@ logger = logging.getLogger("cabinguard")
 def normalize_place(value: str) -> str:
     """Normalize POI names so users can omit punctuation or branch decorations."""
     value = value.strip().lower().replace("（", "(").replace("）", ")")
-    value = re.sub(r"\s+", "", value)
+    value = re.sub(r"[\s,，。!！?？、]", "", value)
+    return value
+
+
+CHINESE_INDEX = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "两": 2}
+
+
+def candidate_aliases(candidate: dict) -> set[str]:
+    name = normalize_place(candidate["name"])
+    aliases = {name}
+    bracket = re.findall(r"\(([^)]+)\)", name)
+    aliases.update(bracket)
+    aliases.add(re.sub(r"\([^)]*\)", "", name))
+    for city in ("上海市", "上海", "北京市", "北京", "杭州市", "杭州"):
+        aliases.add(name.removeprefix(city))
+    return {alias for alias in aliases if len(alias) >= 2}
+
+
+def normalized_user_place(text: str) -> str:
+    value = normalize_place(text)
+    value = re.sub(r"^(我想去|我要去|带我去|去|选|选择|就是|那个|这个|刚才|请导航到)", "", value)
+    value = re.sub(r"(那个|这个|吧|呀|啊)$", "", value)
     return value
 
 
 def select_candidate(candidates: list[dict], text: str) -> dict | None:
-    normalized = normalize_place(text)
-    ordinal = re.search(r"(?:第)?([123])(?:个|号)?", normalized)
-    if ordinal:
-        index = int(ordinal.group(1)) - 1
-        if index < len(candidates):
-            return candidates[index]
+    normalized = normalized_user_place(text)
+    numeric = re.search(r"(?:第)?([1-5])(?:个|号|项)?", normalized)
+    chinese = re.search(r"第?([一二三四五两])(?:个|号|项)?", normalized)
+    index = int(numeric.group(1)) if numeric else CHINESE_INDEX.get(chinese.group(1)) if chinese else None
+    if index and index <= len(candidates):
+        return candidates[index - 1]
+    ranked: list[tuple[float, dict]] = []
     for candidate in candidates:
-        name = normalize_place(candidate["name"])
-        if normalized == name:
-            return candidate
-    for candidate in candidates:
-        name = normalize_place(candidate["name"])
-        if normalized in name or name in normalized:
-            return candidate
+        for alias in candidate_aliases(candidate):
+            if normalized == alias or (len(normalized) >= 2 and normalized in alias):
+                return candidate
+            score = SequenceMatcher(None, normalized, alias).ratio()
+            if normalized and alias:
+                overlap = len(set(normalized) & set(alias)) / max(1, len(set(normalized)))
+                score = max(score, overlap * 0.9)
+            ranked.append((score, candidate))
+    score, candidate = max(ranked, default=(0, None), key=lambda item: item[0])
+    return candidate if score >= 0.78 else None
+
+
+async def resolve_candidate_with_llm(candidates: list[dict], text: str) -> dict | None:
+    """Ask DeepSeek to select one existing POI only; never permit a new destination."""
+    if not settings.llm_enabled:
+        return None
+    options = [{"index": index + 1, "name": candidate["name"], "address": candidate.get("address", "")} for index, candidate in enumerate(candidates)]
+    endpoint = f"{settings.deepseek_base_url.rstrip('/')}/chat/completions"
+    messages = [
+        {"role": "system", "content": "你是导航候选项消歧器。只能从提供的候选项中选一个。若不能确定，返回 {\"index\": null, \"confidence\": 0}。只输出 JSON。"},
+        {"role": "user", "content": json.dumps({"user_utterance": text, "candidates": options}, ensure_ascii=False)},
+    ]
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=3.0), trust_env=settings.deepseek_use_env_proxy) as client:
+            response = await client.post(endpoint, headers={"Authorization": f"Bearer {settings.deepseek_api_key}"}, json={
+                "model": settings.deepseek_model, "messages": messages, "temperature": 0, "response_format": {"type": "json_object"},
+            })
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"].get("content") or "{}"
+        decision = json.loads(content)
+        index = decision.get("index")
+        confidence = float(decision.get("confidence", 0))
+        if isinstance(index, int) and 1 <= index <= len(candidates) and confidence >= 0.55:
+            logger.info("DeepSeek resolved navigation candidate %s for session input", index)
+            return candidates[index - 1]
+    except Exception as exc:
+        logger.warning("DeepSeek candidate resolution failed (%s)", type(exc).__name__)
     return None
 
 
 def candidate_prompt(candidates: list[dict]) -> str:
     options = "、".join(f"{index + 1}. {candidate['name']}" for index, candidate in enumerate(candidates[:3]))
-    return f"我还不能确认具体目的地。请回复地点全名或序号：{options}。"
+    return f"我还不能确认具体目的地。您可以说“第一个”“第三个”或地点中的关键词，例如“北进站口”。候选为：{options}。"
 
 
 async def handle_message(state: SessionState, text: str) -> str:
@@ -66,6 +119,8 @@ async def handle_message(state: SessionState, text: str) -> str:
     # Candidate selection should remain deterministic to make the demo stable.
     if state.navigation.status == "selecting" and state.navigation.candidates:
         selected = select_candidate(state.navigation.candidates, text)
+        if not selected:
+            selected = await resolve_candidate_with_llm(state.navigation.candidates, text)
         if selected:
             response = await execute_tool(state, "navigation_service", {"action": "preview", "destination": selected})
             return remember(state, response)

@@ -8,25 +8,44 @@ type State = any;
 
 declare global { interface Window { AMap?: any; _AMapSecurityConfig?: {securityJsCode: string} } }
 
-function AmapRoute({state}: {state: State}) {
-  const element = useRef<HTMLDivElement>(null); const map = useRef<any>(null);
+function AmapRoute({state, onParkPosition}: {state: State, onParkPosition: (longitude: number, latitude: number) => void}) {
+  const element = useRef<HTMLDivElement>(null); const map = useRef<any>(null); const vehicleMarker = useRef<any>(null); const [ready, setReady] = useState(false);
   const key = import.meta.env.VITE_AMAP_JS_KEY; const security = import.meta.env.VITE_AMAP_SECURITY_CODE;
+  const route = state.navigation.route; const destination = state.navigation.destination;
+  const routeSignature = route && destination ? `${destination.id || destination.name}:${route.distance_km}:${route.polyline?.length}` : 'none';
   useEffect(() => {
     if (!key || !element.current) return;
     const load = () => new Promise<void>((resolve, reject) => {
       if (window.AMap) return resolve();
       if (security) window._AMapSecurityConfig = {securityJsCode: security};
-      const script = document.createElement('script'); script.src = `https://webapi.amap.com/maps?v=2.0&key=${key}`; script.onload = () => resolve(); script.onerror = () => reject(); document.head.appendChild(script);
+      const script = document.createElement('script'); script.src = `https://webapi.amap.com/maps?v=2.0&key=${key}&plugin=AMap.Driving`; script.onload = () => resolve(); script.onerror = () => reject(); document.head.appendChild(script);
     });
-    load().then(() => { if (element.current && !map.current) map.current = new window.AMap.Map(element.current, {zoom: 11, center: [state.vehicle.longitude, state.vehicle.latitude]}); }).catch(() => undefined);
+    load().then(() => { if (element.current && !map.current) { map.current = new window.AMap.Map(element.current, {zoom: 11, center: [state.vehicle.longitude, state.vehicle.latitude]}); setReady(true); } }).catch(() => undefined);
   }, [key, security]);
   useEffect(() => {
-    if (!map.current || !window.AMap) return;
-    map.current.clearMap(); const start = [state.vehicle.longitude, state.vehicle.latitude]; const overlays = [new window.AMap.Marker({position: start, title: '当前位置'})];
-    const route = state.navigation.route; const destination = state.navigation.destination;
-    if (route?.polyline && destination) { overlays.push(new window.AMap.Polyline({path: route.polyline, strokeColor: '#45d8d1', strokeWeight: 6}), new window.AMap.Marker({position: [destination.lng, destination.lat], title: destination.name})); map.current.add(overlays); map.current.setFitView(overlays, false, [60,60,60,60]); }
+    if (!ready || !map.current || !window.AMap) return;
+    map.current.clearMap(); const start = [state.vehicle.longitude, state.vehicle.latitude]; vehicleMarker.current = new window.AMap.Marker({position: start, title: '车辆当前位置', offset: new window.AMap.Pixel(-12, -12)}); const overlays = [vehicleMarker.current];
+    if (route?.polyline && destination) {
+      const drawFallback = () => { overlays.push(new window.AMap.Polyline({path: route.polyline, strokeColor: '#45d8d1', strokeWeight: 6}), new window.AMap.Marker({position: [destination.lng, destination.lat], title: destination.name})); map.current.add(overlays); map.current.setFitView(overlays, false, [60,60,60,60]); };
+      if (window.AMap.Driving) {
+        const driving = new window.AMap.Driving({map: map.current, policy: window.AMap.DrivingPolicy.LEAST_TIME, hideMarkers: false});
+        driving.search(start, [destination.lng, destination.lat], (status: string) => { if (status !== 'complete') drawFallback(); else map.current.add(vehicleMarker.current); });
+      } else drawFallback();
+    }
     else { map.current.add(overlays); map.current.setCenter(start); }
-  }, [state.vehicle.latitude, state.vehicle.longitude, state.navigation.route, state.navigation.destination]);
+  }, [ready, routeSignature]);
+  useEffect(() => {
+    if (!ready || !map.current || !vehicleMarker.current) return;
+    const position = [state.vehicle.longitude, state.vehicle.latitude];
+    vehicleMarker.current.setPosition(position);
+    if (state.navigation.status === 'active') map.current.panTo(position);
+  }, [ready, state.vehicle.longitude, state.vehicle.latitude, state.navigation.status]);
+  useEffect(() => {
+    if (!ready || !map.current) return;
+    const handler = (event: any) => { if (state.navigation.status === 'idle' && state.vehicle.speed_kmh === 0) onParkPosition(event.lnglat.lng, event.lnglat.lat); };
+    map.current.on('click', handler);
+    return () => map.current?.off('click', handler);
+  }, [ready, state.navigation.status, state.vehicle.speed_kmh, onParkPosition]);
   return key ? <div ref={element} className="amap-canvas" /> : null;
 }
 
@@ -39,6 +58,17 @@ function App() {
   const recorder = useRef<MediaRecorder | null>(null);
   const recognition = useRef<any>(null);
   const chunks = useRef<Blob[]>([]);
+  const advancing = useRef(false);
+
+  const setParkPosition = async (longitude: number, latitude: number) => {
+    if (!state || state.navigation.status !== 'idle' || state.vehicle.speed_kmh !== 0) return;
+    try {
+      const vehicle = {...state.vehicle, longitude, latitude, speed_kmh: 0};
+      const response = await fetch(`${API}/api/sessions/${state.session_id}/simulation`, {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({vehicle})});
+      const data = await response.json(); if (!response.ok) throw new Error(data.detail || '设置停车位置失败');
+      setState(data.state); setStatus('停车位置已更新');
+    } catch (error) { setStatus(`设置位置失败：${error instanceof Error ? error.message : '未知错误'}`); }
+  };
 
   const send = async (text: string) => {
     if (!state || !text.trim()) return;
@@ -135,17 +165,35 @@ function App() {
     return () => { controller.abort(); socket?.close(); window.clearTimeout(timeout); };
   }, []);
 
+  useEffect(() => {
+    if (!state || state.navigation.status !== 'active') return;
+    const tick = async () => {
+      if (advancing.current) return;
+      advancing.current = true;
+      try {
+        const response = await fetch(`${API}/api/sessions/${state.session_id}/navigation/advance`, {method: 'POST'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || '导航模拟失败');
+        setState(data);
+      } catch (error) { setStatus(`导航模拟失败：${error instanceof Error ? error.message : '未知错误'}`); }
+      finally { advancing.current = false; }
+    };
+    void tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [state?.session_id, state?.navigation.status]);
+
   if (!state) return <main className="loading"><div><b>CabinGuard 正在启动…</b>{startupError && <p>启动失败：{startupError}</p>}</div></main>;
   const route = state.navigation.route;
   return <main className="app-shell">
     <header><div><span className="eyebrow">CABINGUARD V2</span><h1>主动式智能座舱</h1></div><div className="status"><i />{status}</div></header>
     <section className="layout">
-      <aside className="panel simulator"><h2>车辆与驾驶员</h2><Metric label="车速" value={`${state.vehicle.speed_kmh} km/h`} /><Metric label="驾驶时长" value={`${state.driver.driving_duration_minutes} min`} />
+      <aside className="panel simulator"><h2>车辆与驾驶员</h2><Metric label="车速" value={`${state.vehicle.speed_kmh.toFixed(1)} km/h`} /><Metric label="驾驶时长" value={formatDuration(state.driver.driving_duration_minutes)} />
         <label>疲劳程度 <output>{Math.round(state.driver.fatigue_level * 100)}%</output><input type="range" min="0" max="1" step=".01" value={state.driver.fatigue_level} onChange={e => updateDriver('fatigue_level', +e.target.value)} /></label>
         <label>注意力 <output>{Math.round(state.driver.attention_level * 100)}%</output><input type="range" min="0" max="1" step=".01" value={state.driver.attention_level} onChange={e => updateDriver('attention_level', +e.target.value)} /></label>
         <div className="scenario-grid"><button onClick={() => scenario('commute')}>正常通勤</button><button onClick={() => scenario('rainy')}>雨天出行</button><button className="danger" onClick={() => scenario('fatigue')}>疲劳驾驶</button></div>
       </aside>
-      <section className="center"><div className="map panel"><AmapRoute state={state}/><div className="map-top"><span>当前路线</span><b>{state.navigation.status === 'active' ? '导航中' : '未导航'}</b></div>{!import.meta.env.VITE_AMAP_JS_KEY && <div className="road"><span className="pin start">●</span><div className="route-line" style={{width: route ? `${Math.max(14, 100 - state.navigation.progress * 75)}%` : '0%'}} /><span className="car" style={{left: `${8 + state.navigation.progress * 70}%`}}>▰</span><span className="pin end">★</span></div>}{route ? <div className="route-info"><b>{route.distance_km} km</b><span>预计 {route.duration_minutes} 分钟</span><button onClick={async () => { const r = await fetch(`${API}/api/sessions/${state.session_id}/navigation/advance`, {method: 'POST'}); setState(await r.json()); }}>模拟前进</button></div> : <p>说“带我去虹桥站”开始导航</p>}</div>
+      <section className="center"><div className="map panel"><AmapRoute state={state} onParkPosition={setParkPosition}/><div className="map-top"><span>当前路线</span><b>{state.navigation.status === 'active' ? `导航中 · ${state.navigation.simulated_speed_kmh.toFixed(1)} km/h` : '停车状态：点击地图设置位置'}</b></div>{!import.meta.env.VITE_AMAP_JS_KEY && <div className="road"><span className="pin start">●</span><div className="route-line" style={{width: route ? `${Math.max(14, 100 - state.navigation.progress * 75)}%` : '0%'}} /><span className="car" style={{left: `${8 + state.navigation.progress * 70}%`}}>▰</span><span className="pin end">★</span></div>}{route ? <div className="route-info"><b>{route.distance_km} km</b><span>预计 {route.duration_minutes} 分钟 · 剩余 {state.navigation.remaining_distance_km ?? route.distance_km} km</span></div> : <p>停车时可点击地图设置车辆位置，然后说“带我去虹桥站”</p>}</div>
         <div className="cabin-cards"><Card icon="♨" label="空调" value={`${state.cabin.temperature}℃ · ${state.cabin.climate_mode}`} /><Card icon="♫" label="媒体" value={`${state.cabin.media_mode} · ${state.cabin.volume}%`} /><Card icon="▧" label="座椅" value={`通风 ${state.cabin.seat_ventilation} · 按摩 ${state.cabin.seat_massage}`} />{state.weather && <Card icon="☂" label="天气" value={`${state.weather.temperature}℃ · ${state.weather.weather}`} />}</div>
         {state.active_alert && <div className="alert">⚠ {state.active_alert}</div>}
       </section>
@@ -156,6 +204,7 @@ function App() {
 }
 function Metric({label, value}: {label: string, value: string}) { return <div className="metric"><span>{label}</span><b>{value}</b></div>; }
 function Card({icon, label, value}: {icon: string, label: string, value: string}) { return <div className="card"><i>{icon}</i><span>{label}</span><b>{value}</b></div>; }
+function formatDuration(minutes: number) { const seconds = Math.round(minutes * 60); return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`; }
 async function speak(text: string) {
   speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text); utterance.lang = 'zh-CN'; utterance.rate = .95; speechSynthesis.speak(utterance);

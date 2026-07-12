@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import random
 import tempfile
 import time
 from pathlib import Path
@@ -69,6 +71,28 @@ def state_or_404(session_id: str):
     return state
 
 
+def position_on_route(polyline: list[list[float]], progress: float) -> tuple[float, float]:
+    """Interpolate an lng/lat position along the returned high-map route geometry."""
+    if not polyline:
+        raise ValueError("路线缺少坐标")
+    if len(polyline) == 1:
+        return polyline[0][0], polyline[0][1]
+    lengths = []
+    total = 0.0
+    for start, end in zip(polyline, polyline[1:]):
+        latitude = math.radians((start[1] + end[1]) / 2)
+        length = math.hypot((end[0] - start[0]) * math.cos(latitude), end[1] - start[1])
+        lengths.append(length); total += length
+    target = total * min(1, max(0, progress))
+    walked = 0.0
+    for start, end, length in zip(polyline, polyline[1:], lengths):
+        if walked + length >= target and length:
+            ratio = (target - walked) / length
+            return start[0] + (end[0] - start[0]) * ratio, start[1] + (end[1] - start[1]) * ratio
+        walked += length
+    return polyline[-1][0], polyline[-1][1]
+
+
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "providers": {"deepseek": settings.llm_enabled, "amap": settings.amap_enabled, "azure": settings.azure_enabled}}
@@ -102,7 +126,10 @@ async def post_message(session_id: str, payload: MessageIn):
 @app.patch("/api/sessions/{session_id}/simulation")
 async def patch_simulation(session_id: str, patch: SimulationPatch):
     state = state_or_404(session_id)
-    if patch.vehicle: state.vehicle = patch.vehicle
+    if patch.vehicle:
+        if state.navigation.status == "active":
+            raise HTTPException(409, "导航中不能手动修改车辆位置")
+        state.vehicle = patch.vehicle
     if patch.driver: state.driver = patch.driver
     messages = await proactive_check(state)
     asyncio.create_task(hub.publish(session_id))
@@ -129,9 +156,28 @@ async def scenario(session_id: str, scenario_id: str):
 async def advance_navigation(session_id: str):
     state = state_or_404(session_id)
     if state.navigation.status != "active": raise HTTPException(400, "当前未开始导航")
-    state.navigation.progress = min(1, state.navigation.progress + .25)
-    if state.navigation.progress >= 1:
-        state.navigation.status = "idle"; state.active_alert = "已到达目的地。"
+    if not state.navigation.route:
+        raise HTTPException(400, "当前导航没有可用路线")
+    simulated_seconds = 1
+    speed = round(random.uniform(56, 64), 1)
+    moved_km = speed * simulated_seconds / 3600
+    total_km = state.navigation.route["distance_km"]
+    remaining_km = max(0, state.navigation.remaining_distance_km - moved_km)
+    state.vehicle.speed_kmh = speed
+    state.driver.driving_duration_minutes += simulated_seconds / 60
+    state.navigation.simulated_speed_kmh = speed
+    state.navigation.simulated_elapsed_minutes += simulated_seconds / 60
+    state.navigation.remaining_distance_km = round(remaining_km, 1)
+    state.navigation.progress = min(1, 1 - remaining_km / total_km) if total_km else 1
+    longitude, latitude = position_on_route(state.navigation.route.get("polyline", []), state.navigation.progress)
+    state.vehicle.longitude = longitude
+    state.vehicle.latitude = latitude
+    if remaining_km <= 0:
+        state.navigation.status = "idle"
+        state.vehicle.speed_kmh = 0
+        state.driver.driving_duration_minutes = 0
+        state.navigation.simulated_speed_kmh = 0
+        state.active_alert = "已到达目的地，车辆已停车，本次驾驶时长已清零。"
     asyncio.create_task(hub.publish(session_id))
     return state.model_dump(mode="json")
 
