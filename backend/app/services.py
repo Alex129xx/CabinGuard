@@ -51,6 +51,23 @@ async def weather(latitude: float, longitude: float) -> dict[str, Any]:
         raise WeatherServiceError("当前无法获取天气信息") from exc
 
 
+async def geocode_location(name: str) -> dict[str, Any]:
+    """Resolve an explicit weather location instead of silently using the car position."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5, connect=3)) as client:
+            response = await client.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": name, "count": 1, "language": "zh", "format": "json"})
+            response.raise_for_status()
+            result = response.json().get("results", [])
+        if not result:
+            raise WeatherServiceError(f"未找到“{name}”的位置")
+        place = result[0]
+        return {"name": place.get("name", name), "lat": place["latitude"], "lng": place["longitude"]}
+    except WeatherServiceError:
+        raise
+    except Exception as exc:
+        raise WeatherServiceError(f"当前无法获取“{name}”的天气") from exc
+
+
 def weather_label(code: int) -> str:
     if code in {51, 53, 55, 61, 63, 65, 80, 81, 82}:
         return "小雨" if code in {51, 53, 61, 80} else "降雨"

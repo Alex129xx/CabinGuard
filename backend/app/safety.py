@@ -17,7 +17,7 @@ def evaluate(tool: str, args: dict, state: SessionState, proactive: bool = False
     speed = state.vehicle.speed_kmh
     driver = state.driver
 
-    if tool == "media_control" and effective.get("mode") == "video" and speed > 0:
+    if tool == "media_control" and effective.get("mode") == "video" and (speed > 0 or state.navigation.status == "active"):
         return GateResult(GateDecision.BLOCK, effective, "行驶过程中无法播放视频。")
     if tool == "seat_control" and speed > 80 and int(effective.get("massage", 0)) > 1:
         effective["massage"] = 1
@@ -34,6 +34,8 @@ def evaluate(tool: str, args: dict, state: SessionState, proactive: bool = False
         if state.navigation.status != "preview":
             return GateResult(GateDecision.CONFIRM, effective, "路线尚未预览，是否先为您规划路线？")
     if tool == "navigation_service" and effective.get("action") == "preview" and state.navigation.status == "active":
+        return GateResult(GateDecision.CONFIRM, effective, "当前正在导航，确定要更换目的地吗？")
+    if tool == "navigation_service" and effective.get("action") == "search" and state.navigation.status == "active":
         return GateResult(GateDecision.CONFIRM, effective, "当前正在导航，确定要更换目的地吗？")
     if tool in {"climate_control", "media_control", "seat_control"} and proactive:
         return GateResult(GateDecision.CONFIRM, effective, "我可以为您执行这项舒适性调节，是否确认？")

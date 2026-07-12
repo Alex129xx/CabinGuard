@@ -70,6 +70,8 @@ def _trace(state: CabinGuardState, node: str, detail: str = "") -> list[dict[str
 
 
 def _final(state: CabinGuardState, text: str, source: str) -> dict[str, Any]:
+    if state.get("event") == "proactive" and not text:
+        return {"final_response": None, "agent_status": "idle", "execution_trace": _trace(state, "response_builder", "no_notification")}
     messages = [*state.get("messages", []), {"role": "assistant", "content": text}][-20:]
     return {"messages": messages, "final_response": text, "response_source": source, "agent_status": "completed", "execution_trace": _trace(state, "response_builder", source)}
 
@@ -80,6 +82,21 @@ def _is_yes(text: str) -> bool:
 
 def _is_no(text: str) -> bool:
     return any(word in text for word in ("取消", "不要", "算了", "否"))
+
+
+def _weather_arguments(state: CabinGuardState, text: str) -> dict[str, Any]:
+    if state.get("navigation", {}).get("destination") and any(word in text for word in ("目的地", "那里", "那边")):
+        return {"action": "destination"}
+    location = re.sub(r"(帮我|请|查询|看看|一下|天气预报|天气怎么样|天气如何|的天气|天气|下雨|温度)", "", text).strip()
+    return {"action": "location", "location": location} if len(location) >= 2 and location not in {"当前", "这里", "现在"} else {"action": "current"}
+
+
+def _seat_arguments(state: CabinGuardState, text: str) -> dict[str, Any]:
+    cabin = state.get("cabin", {})
+    heating = 2 if "加热" in text else cabin.get("seat_heating", 0)
+    ventilation = 0 if "加热" in text else 2 if "通风" in text else cabin.get("seat_ventilation", 0)
+    massage = 3 if any(word in text for word in ("最大", "最强", "三档")) else 1 if "按摩" in text else cabin.get("seat_massage", 0)
+    return {"heating": heating, "ventilation": ventilation, "massage": massage}
 
 
 def router(state: CabinGuardState) -> Command[Literal["candidate", "planner", "safety", "approval", "proactive", "finish"]]:
@@ -96,6 +113,17 @@ def router(state: CabinGuardState) -> Command[Literal["candidate", "planner", "s
         base = {"messages": messages, "agent_status": "understanding", "execution_trace": _trace(state, "input_router", "message")}
         if any(word in text.replace(" ", "") for word in ("取消导航", "结束导航", "停止导航", "不导航了")):
             return Command(goto="safety", update={**base, "planned_calls": [{"name": "stop_navigation", "arguments": {}}], "planner_reply": None, "response_source": "rule"})
+        if any(word in text for word in ("天气", "下雨", "温度")):
+            return Command(goto="safety", update={**base, "planned_calls": [{"name": "get_weather", "arguments": _weather_arguments(state, text)}], "planner_reply": None, "response_source": "rule"})
+        if "座椅" in text and any(word in text for word in ("加热", "通风", "按摩")):
+            return Command(goto="safety", update={**base, "planned_calls": [{"name": "set_seat", "arguments": _seat_arguments(state, text)}], "planner_reply": None, "response_source": "rule"})
+        if "视频" in text or "电影" in text:
+            return Command(goto="safety", update={**base, "planned_calls": [{"name": "set_media", "arguments": {"mode": "video"}}], "planner_reply": None, "response_source": "rule"})
+        if "音乐" in text:
+            return Command(goto="safety", update={**base, "planned_calls": [{"name": "set_media", "arguments": {"mode": "music"}}], "planner_reply": None, "response_source": "rule"})
+        if any(word in text for word in ("带我去", "导航到")):
+            destination = re.sub(r".*?(带我去|导航到)", "", text).strip()
+            return Command(goto="safety", update={**base, "planned_calls": [{"name": "search_poi", "arguments": {"query": destination or "虹桥站"}}], "planner_reply": None, "response_source": "rule"})
         if state.get("navigation", {}).get("status") == "selecting":
             return Command(goto="candidate", update=base)
         return Command(goto="planner", update=base)
@@ -247,16 +275,20 @@ async def proactive(state: CabinGuardState) -> dict[str, Any]:
     messages: list[str] = []
     def due(key: str, seconds: int = 600) -> bool:
         return now - float(trigger.get(key, 0)) >= seconds
-    if domain.vehicle.ignition_on and not trigger.get("ignition"):
-        trigger["ignition"] = now
+    scenario = state.get("event_payload", {}).get("scenario_id")
+    if scenario == "rainy":
         calls.append({"name": "get_weather", "arguments": {"action": "current"}})
-        messages.append("车辆已点火，正在检查当前天气和车辆状态。")
-    if domain.driver.fatigue_level >= .8 and due("fatigue_critical", 60):
+        messages.append("雨天出行场景已加载，正在查询当前位置的真实天气。")
+    elif domain.driver.fatigue_level >= .8 and due("fatigue_critical", 60):
         trigger["fatigue_critical"] = now
         calls.append({"name": "emit_safety_alert", "arguments": {"action": "alert", "level": "critical", "message": "检测到明显疲劳风险，请尽快进入休息区休息。"}})
     elif domain.driver.driving_duration_minutes >= 120 and due("rest"):
         trigger["rest"] = now
         calls.append({"name": "emit_safety_alert", "arguments": {"action": "alert", "level": "warning", "message": "您已连续驾驶较长时间，建议尽快休息。"}})
+    elif domain.vehicle.ignition_on and not trigger.get("ignition"):
+        trigger["ignition"] = now
+        calls.append({"name": "get_weather", "arguments": {"action": "current"}})
+        messages.append("车辆已点火，正在检查当前天气和车辆状态。")
     elif (domain.cabin.temperature >= 27 or domain.cabin.temperature < 18) and due("climate"):
         trigger["climate"] = now
         calls.append({"name": "set_temperature", "arguments": {"temperature": 23, "mode": "auto"}})
@@ -264,7 +296,7 @@ async def proactive(state: CabinGuardState) -> dict[str, Any]:
 
 
 def finish(state: CabinGuardState) -> dict[str, Any]:
-    reply = state.get("planner_reply") or state.get("final_response") or "已完成。"
+    reply = state.get("planner_reply") or (None if state.get("event") == "proactive" else state.get("final_response")) or ""
     return _final(state, reply, state.get("response_source", "rule"))
 
 

@@ -158,7 +158,7 @@ async def scenario(session_id: str, scenario_id: str):
         vehicle.update({"ignition_on": True, "speed_kmh": 105}); driver.update({"fatigue_level": .9, "attention_level": .38, "driving_duration_minutes": 145})
     else:
         raise HTTPException(404, "未知场景")
-    result, _, _ = await store.run(session_id, {"event": "proactive", "vehicle": vehicle, "driver": driver, "cabin": cabin})
+    result, _, _ = await store.run(session_id, {"event": "proactive", "vehicle": vehicle, "driver": driver, "cabin": cabin, "event_payload": {"scenario_id": scenario_id}})
     asyncio.create_task(hub.publish(session_id))
     return {"messages": [result.final_response] if result and result.final_response else [], "state": result.model_dump(mode="json") if result else state.model_dump(mode="json")}
 

@@ -9,7 +9,7 @@ type State = any;
 declare global { interface Window { AMap?: any; _AMapSecurityConfig?: {securityJsCode: string} } }
 
 function AmapRoute({state, onParkPosition}: {state: State, onParkPosition: (longitude: number, latitude: number) => void}) {
-  const element = useRef<HTMLDivElement>(null); const map = useRef<any>(null); const vehicleMarker = useRef<any>(null); const displayedPosition = useRef<[number, number] | null>(null); const cameraPosition = useRef<[number, number] | null>(null); const navigationWasActive = useRef(false); const animationFrame = useRef<number | null>(null); const [ready, setReady] = useState(false);
+  const element = useRef<HTMLDivElement>(null); const map = useRef<any>(null); const vehicleMarker = useRef<any>(null); const drivingService = useRef<any>(null); const displayedPosition = useRef<[number, number] | null>(null); const cameraPosition = useRef<[number, number] | null>(null); const navigationWasActive = useRef(false); const animationFrame = useRef<number | null>(null); const routeVersion = useRef(0); const [ready, setReady] = useState(false);
   const key = import.meta.env.VITE_AMAP_JS_KEY; const security = import.meta.env.VITE_AMAP_SECURITY_CODE;
   const route = state.navigation.route; const destination = state.navigation.destination;
   const routeSignature = route && destination ? `${destination.id || destination.name}:${route.distance_km}:${route.polyline?.length}` : 'none';
@@ -24,15 +24,20 @@ function AmapRoute({state, onParkPosition}: {state: State, onParkPosition: (long
   }, [key, security]);
   useEffect(() => {
     if (!ready || !map.current || !window.AMap) return;
+    const version = ++routeVersion.current;
+    drivingService.current?.clear?.();
+    drivingService.current = null;
     map.current.clearMap(); const start: [number, number] = [state.vehicle.longitude, state.vehicle.latitude]; displayedPosition.current = start; vehicleMarker.current = new window.AMap.Marker({position: start, title: '车辆当前位置', content: '<div class="vehicle-marker">🚗</div>', offset: new window.AMap.Pixel(-17, -17), zIndex: 200}); const overlays = [vehicleMarker.current];
     if (route?.polyline && destination) {
-      const drawFallback = () => { overlays.push(new window.AMap.Polyline({path: route.polyline, strokeColor: '#45d8d1', strokeWeight: 6}), new window.AMap.Marker({position: [destination.lng, destination.lat], title: destination.name})); map.current.add(overlays); map.current.setFitView(overlays, false, [60,60,60,60]); };
+      const drawFallback = () => { if (version !== routeVersion.current) return; overlays.push(new window.AMap.Polyline({path: route.polyline, strokeColor: '#45d8d1', strokeWeight: 6}), new window.AMap.Marker({position: [destination.lng, destination.lat], title: destination.name})); map.current.add(overlays); map.current.setFitView(overlays, false, [60,60,60,60]); };
       if (window.AMap.Driving) {
         const driving = new window.AMap.Driving({map: map.current, policy: window.AMap.DrivingPolicy.LEAST_TIME, hideMarkers: true});
-        driving.search(start, [destination.lng, destination.lat], (status: string) => { if (status !== 'complete') drawFallback(); else map.current.add(vehicleMarker.current); });
+        drivingService.current = driving;
+        driving.search(start, [destination.lng, destination.lat], (status: string) => { if (version !== routeVersion.current) return; if (status !== 'complete') drawFallback(); else map.current.add(vehicleMarker.current); });
       } else drawFallback();
     }
     else { map.current.add(overlays); map.current.setCenter(start); }
+    return () => { if (drivingService.current) { drivingService.current.clear?.(); drivingService.current = null; } };
   }, [ready, routeSignature]);
   useEffect(() => {
     if (!ready || !map.current || !vehicleMarker.current) return;
@@ -64,6 +69,7 @@ function App() {
   const [status, setStatus] = useState('正在连接');
   const [startupError, setStartupError] = useState('');
   const [recording, setRecording] = useState(false);
+  const [providers, setProviders] = useState<Record<string, boolean>>({});
   const recognition = useRef<any>(null);
   const advancing = useRef(false);
 
@@ -110,15 +116,18 @@ function App() {
 
   const scenario = async (id: string) => {
     if (!state) return;
-    const r = await fetch(`${API}/api/sessions/${state.session_id}/scenarios/${id}`, {method: 'POST'});
-    const data = await r.json(); setState(data.state); if (VOICE_ENABLED) data.messages?.forEach((m: string) => void speak(m));
+    try {
+      const r = await fetch(`${API}/api/sessions/${state.session_id}/scenarios/${id}`, {method: 'POST'});
+      const data = await r.json(); if (!r.ok) throw new Error(data.detail || '场景加载失败');
+      setState(data.state); const message = data.messages?.[0] || '场景已加载'; setStatus(message); if (VOICE_ENABLED) data.messages?.forEach((m: string) => void speak(m));
+    } catch (error) { setStatus(`场景加载失败：${error instanceof Error ? error.message : '未知错误'}`); }
   };
 
   const updateDriver = async (field: string, value: number) => {
     if (!state) return;
     const driver = {...state.driver, [field]: value};
     const r = await fetch(`${API}/api/sessions/${state.session_id}/simulation`, {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({driver})});
-    const data = await r.json(); setState(data.state); if (VOICE_ENABLED) data.messages?.forEach((m: string) => void speak(m));
+    const data = await r.json(); if (!r.ok) { setStatus(data.detail || '驾驶员状态更新失败'); return; } setState(data.state); if (VOICE_ENABLED) data.messages?.forEach((m: string) => void speak(m));
   };
 
   const cancelNavigation = async () => {
@@ -169,6 +178,7 @@ function App() {
         if (!r?.ok) throw new Error(s.detail || '创建会话失败');
         localStorage.setItem('cabinguard.session_id', s.session_id);
         setState(s); setStatus('等待指令');
+        void fetch(`${API}/api/health`).then(r => r.ok ? r.json() : null).then(data => { if (data?.providers) setProviders(data.providers); }).catch(() => undefined);
       } catch (error) {
         const message = error instanceof DOMException && error.name === 'AbortError' ? '连接后端超时' : error instanceof Error ? error.message : '无法连接后端';
         setStartupError(`${message}（${API}）`); setStatus('后端连接失败');
@@ -197,8 +207,10 @@ function App() {
 
   if (!state) return <main className="loading"><div><b>CabinGuard 正在启动…</b>{startupError && <p>启动失败：{startupError}</p>}</div></main>;
   const route = state.navigation.route;
+  const weather = state.weather;
+  const browserSpeech = Boolean((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
   return <main className="app-shell">
-    <header><div><span className="eyebrow">CABINGUARD V3</span><h1>主动式智能座舱</h1></div><div className="status"><i />{state.agent_status || status}</div><button onClick={resetDemo}>重新开始演示</button></header>
+    <header><div><span className="eyebrow">CABINGUARD V3</span><h1>主动式智能座舱</h1></div><div className="status"><i />{state.agent_status && !['idle', 'completed'].includes(state.agent_status) ? state.agent_status : status}</div><button onClick={resetDemo}>重新开始演示</button></header>
     <section className="layout">
       <aside className="panel simulator"><h2>车辆与驾驶员</h2><Metric label="车速" value={`${state.vehicle.speed_kmh.toFixed(1)} km/h`} /><Metric label="驾驶时长" value={formatDuration(state.driver.driving_duration_minutes)} />
         <label>疲劳程度 <output>{Math.round(state.driver.fatigue_level * 100)}%</output><input type="range" min="0" max="1" step=".01" value={state.driver.fatigue_level} onChange={e => updateDriver('fatigue_level', +e.target.value)} /></label>
@@ -206,7 +218,8 @@ function App() {
         <div className="scenario-grid"><button onClick={() => scenario('commute')}>正常通勤</button><button onClick={() => scenario('rainy')}>雨天出行</button><button className="danger" onClick={() => scenario('fatigue')}>疲劳驾驶</button></div>
       </aside>
       <section className="center"><div className="map panel"><AmapRoute state={state} onParkPosition={setParkPosition}/><div className="map-top"><span>当前路线</span><b>{state.navigation.status === 'active' ? `导航中 · ${state.navigation.simulated_speed_kmh.toFixed(1)} km/h` : '停车状态：点击地图设置位置'}</b></div>{!import.meta.env.VITE_AMAP_JS_KEY && <div className="road"><span className="pin start">●</span><div className="route-line" style={{width: route ? '100%' : '0%'}} /><span className="car" style={{left: '8%'}}>▰</span><span className="pin end">★</span></div>}{route ? <div className="route-info"><b>{route.distance_km} km</b><span>预计 {route.duration_minutes} 分钟</span>{state.navigation.status !== 'idle' && <button onClick={cancelNavigation}>结束导航并清除路线</button>}</div> : <p>停车时可点击地图设置车辆位置，然后说“带我去虹桥站”</p>}</div>
-        <div className="cabin-cards"><Card icon="♨" label="空调" value={`${state.cabin.temperature}℃ · ${state.cabin.climate_mode}`} /><Card icon="♫" label="媒体" value={`${state.cabin.media_mode} · ${state.cabin.volume}%`} /><Card icon="▧" label="座椅" value={`通风 ${state.cabin.seat_ventilation} · 按摩 ${state.cabin.seat_massage}`} />{state.weather && <Card icon="☂" label="天气" value={`${state.weather.temperature}℃ · ${state.weather.weather}`} />}</div>
+        <div className="cabin-cards"><Card icon="♨" label="空调" value={`${state.cabin.temperature}℃ · ${state.cabin.climate_mode}`} /><Card icon="♫" label="媒体" value={`${state.cabin.media_mode} · ${state.cabin.volume}%`} /><Card icon="▧" label="座椅" value={`加热 ${state.cabin.seat_heating} · 通风 ${state.cabin.seat_ventilation} · 按摩 ${state.cabin.seat_massage}`} />{weather && <Card icon="☂" label="天气" value={`${weather.location || '当前位置'} · ${weather.temperature}℃ ${weather.weather} · 降水 ${weather.precipitation_probability}%${weather.cached ? '（缓存）' : ''}`} />}</div>
+        <div className="service-status"><small>服务状态：DeepSeek {providers.deepseek ? '可用' : '未配置'} · 高德 {providers.amap ? '可用' : '未配置'} · 天气 {providers.weather ? '可用' : '检查中'} · 浏览器语音 {browserSpeech ? '可用' : '不可用'}</small></div>
         {state.active_alert && <div className="alert">⚠ {state.active_alert}</div>}
       </section>
       <aside className="panel agent"><h2>Agent 决策面板</h2><div className="history">{state.messages.map((m: any, i: number) => <div key={i} className={m.role}><small>{m.role === 'user' ? '你' : 'CabinGuard'}</small>{m.content}</div>)}</div>{state.navigation.candidates?.length > 0 && state.navigation.status === 'selecting' && <div className="confirm"><b>选择目的地</b>{state.navigation.candidates.map((p: any) => <button key={p.id} onClick={() => send(p.name, p.id)}>{p.name}<small>{p.address}</small></button>)}</div>}{state.pending_action && <div className="confirm"><b>需要确认</b><p>{state.pending_action.prompt}</p><button onClick={() => resume(true)}>确认执行</button><button onClick={() => resume(false)}>取消</button></div>}<h3>工具与安全日志</h3><div className="logs">{state.tool_logs.map((log: any, i: number) => <div key={i}><b className={log.decision}>{log.decision}</b><span>{log.tool}</span><small>{log.message}</small></div>)}</div><details><summary>Agent 执行轨迹</summary>{state.execution_trace?.map((item: any, i: number) => <div key={i}><small>{item.node} · {item.detail}</small></div>)}</details></aside>

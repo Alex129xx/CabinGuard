@@ -3,7 +3,7 @@ from __future__ import annotations
 from uuid import uuid4
 from .safety import evaluate
 from .schemas import GateDecision, PendingAction, SessionState, ToolLog
-from .services import AmapServiceError, WeatherServiceError, driving_route, now_iso, search_poi, weather
+from .services import AmapServiceError, WeatherServiceError, driving_route, geocode_location, now_iso, search_poi, weather
 
 
 async def execute_tool(state: SessionState, tool: str, args: dict, proactive: bool = False, skip_gate: bool = False) -> str:
@@ -37,9 +37,14 @@ async def execute_tool(state: SessionState, tool: str, args: dict, proactive: bo
         return f"{message}"
 
     if tool == "weather_service":
-        target = state.navigation.destination if effective.get("action") == "destination" and state.navigation.destination else {"lat": state.vehicle.latitude, "lng": state.vehicle.longitude, "name": "当前位置"}
         try:
-            state.weather = await weather(target["lat"], target["lng"])
+            if effective.get("location"):
+                target = await geocode_location(str(effective["location"]))
+            elif effective.get("action") == "destination" and state.navigation.destination:
+                target = state.navigation.destination
+            else:
+                target = {"lat": state.vehicle.latitude, "lng": state.vehicle.longitude, "name": "当前位置"}
+            state.weather = {**await weather(target["lat"], target["lng"]), "location": target.get("name", "当前位置")}
         except WeatherServiceError as exc:
             return str(exc)
         return f"{target.get('name', '当前位置')} {state.weather['temperature']}℃，{state.weather['weather']}，降水概率 {state.weather['precipitation_probability']}%。"
@@ -79,6 +84,7 @@ async def execute_tool(state: SessionState, tool: str, args: dict, proactive: bo
             return f"导航已开始，预计 {state.navigation.route['duration_minutes']} 分钟到达。"
         if action == "cancel":
             state.navigation.status = "idle"; state.navigation.route = None; state.navigation.destination = None
+            state.navigation.candidates = []
             state.navigation.progress = 0; state.navigation.remaining_distance_km = 0; state.navigation.simulated_speed_kmh = 0; state.navigation.simulated_elapsed_minutes = 0
             state.vehicle.speed_kmh = 0; state.driver.driving_duration_minutes = 0
             return "已取消导航。"
