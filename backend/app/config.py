@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     azure_speech_key: str | None = None
     azure_speech_region: str | None = None
     azure_speech_endpoint: str | None = None
+    azure_speech_enabled: bool = False
 
     @property
     def llm_enabled(self) -> bool:
@@ -29,7 +30,7 @@ class Settings(BaseSettings):
 
     @property
     def azure_enabled(self) -> bool:
-        return bool(self.azure_speech_key and (self.azure_speech_region or self.azure_speech_endpoint))
+        return bool(self.azure_speech_enabled and self.azure_speech_key and (self.azure_speech_region or self.azure_speech_endpoint))
 
 
 settings = Settings()

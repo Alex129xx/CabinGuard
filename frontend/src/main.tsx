@@ -3,7 +3,7 @@ import {createRoot} from 'react-dom/client';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-const VOICE_ENABLED = false;
+const VOICE_ENABLED = true;
 type State = any;
 
 declare global { interface Window { AMap?: any; _AMapSecurityConfig?: {securityJsCode: string} } }
@@ -37,6 +37,7 @@ function App() {
   const [startupError, setStartupError] = useState('');
   const [recording, setRecording] = useState(false);
   const recorder = useRef<MediaRecorder | null>(null);
+  const recognition = useRef<any>(null);
   const chunks = useRef<Blob[]>([]);
 
   const send = async (text: string) => {
@@ -49,6 +50,7 @@ function App() {
       const data = await r.json();
       if (!r.ok) throw new Error(data.detail || 'Agent 请求失败');
       setState(data.state); setInput(''); setStatus('等待指令');
+      if (VOICE_ENABLED) void speak(data.response);
     } catch (error) {
       const message = error instanceof DOMException && error.name === 'AbortError' ? 'Agent 响应超时，请检查后端或 DeepSeek 网络' : error instanceof Error ? error.message : '请检查后端服务';
       setStatus(`发送失败：${message}`);
@@ -58,17 +60,33 @@ function App() {
   const scenario = async (id: string) => {
     if (!state) return;
     const r = await fetch(`${API}/api/sessions/${state.session_id}/scenarios/${id}`, {method: 'POST'});
-    const data = await r.json(); setState(data.state);
+    const data = await r.json(); setState(data.state); if (VOICE_ENABLED) data.messages?.forEach((m: string) => void speak(m));
   };
 
   const updateDriver = async (field: string, value: number) => {
     if (!state) return;
     const driver = {...state.driver, [field]: value};
     const r = await fetch(`${API}/api/sessions/${state.session_id}/simulation`, {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({driver})});
-    const data = await r.json(); setState(data.state);
+    const data = await r.json(); setState(data.state); if (VOICE_ENABLED) data.messages?.forEach((m: string) => void speak(m));
   };
 
   const startRecording = async () => {
+    const BrowserRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (BrowserRecognition) {
+      const instance = new BrowserRecognition();
+      recognition.current = instance;
+      instance.lang = 'zh-CN'; instance.interimResults = false; instance.maxAlternatives = 1;
+      instance.onresult = async (event: any) => {
+        const text = event.results?.[0]?.[0]?.transcript?.trim();
+        if (text) { setInput(text); await send(text); }
+        else setStatus('未识别到语音，请重试或使用键盘输入');
+      };
+      instance.onerror = (event: any) => setStatus(`语音识别失败：${event.error || '未知错误'}`);
+      instance.onend = () => { setRecording(false); recognition.current = null; };
+      try { instance.start(); setRecording(true); setStatus('正在录音'); }
+      catch (error) { setStatus(`麦克风不可用：${error instanceof Error ? error.message : '请检查浏览器权限'}`); }
+      return;
+    }
     try {
       if (!navigator.mediaDevices?.getUserMedia) throw new Error('当前浏览器不支持麦克风录音');
       const stream = await navigator.mediaDevices.getUserMedia({audio: true});
@@ -91,7 +109,11 @@ function App() {
       recorder.current.start(); setRecording(true); setStatus('正在录音');
     } catch (error) { setStatus(`麦克风不可用：${error instanceof Error ? error.message : '请检查浏览器权限'}`); }
   };
-  const stopRecording = () => { recorder.current?.stop(); setRecording(false); };
+  const stopRecording = () => {
+    if (recognition.current) recognition.current.stop();
+    else recorder.current?.stop();
+    setRecording(false);
+  };
 
   useEffect(() => {
     let socket: WebSocket | undefined;
@@ -136,10 +158,6 @@ function Metric({label, value}: {label: string, value: string}) { return <div cl
 function Card({icon, label, value}: {icon: string, label: string, value: string}) { return <div className="card"><i>{icon}</i><span>{label}</span><b>{value}</b></div>; }
 async function speak(text: string) {
   speechSynthesis.cancel();
-  try {
-    const response = await fetch(`${API}/api/speech/synthesize`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text, style: 'general'})});
-    if (response.ok) { const url = URL.createObjectURL(await response.blob()); const audio = new Audio(url); audio.onended = () => URL.revokeObjectURL(url); await audio.play(); return; }
-  } catch { /* Browser TTS remains the final no-network fallback. */ }
   const utterance = new SpeechSynthesisUtterance(text); utterance.lang = 'zh-CN'; utterance.rate = .95; speechSynthesis.speak(utterance);
 }
 async function toWav(blob: Blob): Promise<Blob> { const ctx = new AudioContext(); const buffer = await ctx.decodeAudioData(await blob.arrayBuffer()); const samples = buffer.getChannelData(0); const target = 16000; const ratio = buffer.sampleRate / target; const out = new Int16Array(Math.ceil(samples.length / ratio)); for (let i = 0; i < out.length; i++) out[i] = Math.max(-1, Math.min(1, samples[Math.floor(i * ratio)])) * 0x7fff; const header = new ArrayBuffer(44); const view = new DataView(header); const put = (o: number, s: string) => [...s].forEach((c, i) => view.setUint8(o + i, c.charCodeAt(0))); put(0,'RIFF'); view.setUint32(4, 36 + out.byteLength, true); put(8,'WAVE'); put(12,'fmt '); view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,1,true); view.setUint32(24,target,true); view.setUint32(28,target*2,true); view.setUint16(32,2,true); view.setUint16(34,16,true); put(36,'data'); view.setUint32(40,out.byteLength,true); ctx.close(); return new Blob([header,out], {type:'audio/wav'}); }
