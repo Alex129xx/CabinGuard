@@ -9,7 +9,7 @@ type State = any;
 declare global { interface Window { AMap?: any; _AMapSecurityConfig?: {securityJsCode: string} } }
 
 function AmapRoute({state, onParkPosition}: {state: State, onParkPosition: (longitude: number, latitude: number) => void}) {
-  const element = useRef<HTMLDivElement>(null); const map = useRef<any>(null); const vehicleMarker = useRef<any>(null); const [ready, setReady] = useState(false);
+  const element = useRef<HTMLDivElement>(null); const map = useRef<any>(null); const vehicleMarker = useRef<any>(null); const displayedPosition = useRef<[number, number] | null>(null); const cameraPosition = useRef<[number, number] | null>(null); const navigationWasActive = useRef(false); const animationFrame = useRef<number | null>(null); const [ready, setReady] = useState(false);
   const key = import.meta.env.VITE_AMAP_JS_KEY; const security = import.meta.env.VITE_AMAP_SECURITY_CODE;
   const route = state.navigation.route; const destination = state.navigation.destination;
   const routeSignature = route && destination ? `${destination.id || destination.name}:${route.distance_km}:${route.polyline?.length}` : 'none';
@@ -24,11 +24,11 @@ function AmapRoute({state, onParkPosition}: {state: State, onParkPosition: (long
   }, [key, security]);
   useEffect(() => {
     if (!ready || !map.current || !window.AMap) return;
-    map.current.clearMap(); const start = [state.vehicle.longitude, state.vehicle.latitude]; vehicleMarker.current = new window.AMap.Marker({position: start, title: '车辆当前位置', offset: new window.AMap.Pixel(-12, -12)}); const overlays = [vehicleMarker.current];
+    map.current.clearMap(); const start: [number, number] = [state.vehicle.longitude, state.vehicle.latitude]; displayedPosition.current = start; vehicleMarker.current = new window.AMap.Marker({position: start, title: '车辆当前位置', content: '<div class="vehicle-marker">🚗</div>', offset: new window.AMap.Pixel(-17, -17), zIndex: 200}); const overlays = [vehicleMarker.current];
     if (route?.polyline && destination) {
       const drawFallback = () => { overlays.push(new window.AMap.Polyline({path: route.polyline, strokeColor: '#45d8d1', strokeWeight: 6}), new window.AMap.Marker({position: [destination.lng, destination.lat], title: destination.name})); map.current.add(overlays); map.current.setFitView(overlays, false, [60,60,60,60]); };
       if (window.AMap.Driving) {
-        const driving = new window.AMap.Driving({map: map.current, policy: window.AMap.DrivingPolicy.LEAST_TIME, hideMarkers: false});
+        const driving = new window.AMap.Driving({map: map.current, policy: window.AMap.DrivingPolicy.LEAST_TIME, hideMarkers: true});
         driving.search(start, [destination.lng, destination.lat], (status: string) => { if (status !== 'complete') drawFallback(); else map.current.add(vehicleMarker.current); });
       } else drawFallback();
     }
@@ -36,17 +36,26 @@ function AmapRoute({state, onParkPosition}: {state: State, onParkPosition: (long
   }, [ready, routeSignature]);
   useEffect(() => {
     if (!ready || !map.current || !vehicleMarker.current) return;
-    const position = [state.vehicle.longitude, state.vehicle.latitude];
-    vehicleMarker.current.setPosition(position);
-    if (state.navigation.status === 'active') map.current.panTo(position);
+    const target: [number, number] = [state.vehicle.longitude, state.vehicle.latitude];
+    const from = displayedPosition.current || target;
+    if (animationFrame.current) cancelAnimationFrame(animationFrame.current);
+    if (state.navigation.status !== 'active') { vehicleMarker.current.setPosition(target); displayedPosition.current = target; cameraPosition.current = target; navigationWasActive.current = false; return; }
+    if (!navigationWasActive.current) { map.current.setZoomAndCenter(16, target); cameraPosition.current = target; navigationWasActive.current = true; }
+    else { const camera = cameraPosition.current!; if (Math.hypot(target[0] - camera[0], target[1] - camera[1]) > 0.001) { map.current.panTo(target); cameraPosition.current = target; } }
+    const started = performance.now();
+    const animate = (now: number) => {
+      const progress = Math.min(1, (now - started) / 900);
+      const eased = progress * (2 - progress);
+      const position: [number, number] = [from[0] + (target[0] - from[0]) * eased, from[1] + (target[1] - from[1]) * eased];
+      vehicleMarker.current?.setPosition(position); displayedPosition.current = position;
+      if (progress < 1) animationFrame.current = requestAnimationFrame(animate);
+    };
+    animationFrame.current = requestAnimationFrame(animate);
+    return () => { if (animationFrame.current) cancelAnimationFrame(animationFrame.current); };
   }, [ready, state.vehicle.longitude, state.vehicle.latitude, state.navigation.status]);
-  useEffect(() => {
-    if (!ready || !map.current) return;
-    const handler = (event: any) => { if (state.navigation.status === 'idle' && state.vehicle.speed_kmh === 0) onParkPosition(event.lnglat.lng, event.lnglat.lat); };
-    map.current.on('click', handler);
-    return () => map.current?.off('click', handler);
-  }, [ready, state.navigation.status, state.vehicle.speed_kmh, onParkPosition]);
-  return key ? <div ref={element} className="amap-canvas" /> : null;
+  const canSetParking = state.navigation.status === 'idle' && state.vehicle.speed_kmh === 0;
+  const setParkingFromCenter = () => { const center = map.current?.getCenter(); if (center) onParkPosition(center.lng, center.lat); };
+  return key ? <><div ref={element} className="amap-canvas" />{canSetParking && <button className="set-parking" onClick={setParkingFromCenter}>设为停车位置</button>}</> : null;
 }
 
 function App() {
@@ -58,7 +67,6 @@ function App() {
   const recorder = useRef<MediaRecorder | null>(null);
   const recognition = useRef<any>(null);
   const chunks = useRef<Blob[]>([]);
-  const advancing = useRef(false);
 
   const setParkPosition = async (longitude: number, latitude: number) => {
     if (!state || state.navigation.status !== 'idle' || state.vehicle.speed_kmh !== 0) return;
@@ -98,6 +106,15 @@ function App() {
     const driver = {...state.driver, [field]: value};
     const r = await fetch(`${API}/api/sessions/${state.session_id}/simulation`, {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({driver})});
     const data = await r.json(); setState(data.state); if (VOICE_ENABLED) data.messages?.forEach((m: string) => void speak(m));
+  };
+
+  const cancelNavigation = async () => {
+    if (!state) return;
+    try {
+      const response = await fetch(`${API}/api/sessions/${state.session_id}/navigation/cancel`, {method: 'POST'});
+      const data = await response.json(); if (!response.ok) throw new Error(data.detail || '结束导航失败');
+      setState(data.state); setStatus(data.response || '导航已结束');
+    } catch (error) { setStatus(`结束导航失败：${error instanceof Error ? error.message : '未知错误'}`); }
   };
 
   const startRecording = async () => {
@@ -146,7 +163,6 @@ function App() {
   };
 
   useEffect(() => {
-    let socket: WebSocket | undefined;
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 8_000);
     (async () => {
@@ -155,33 +171,13 @@ function App() {
         const s = await r.json();
         if (!r.ok) throw new Error(s.detail || '创建会话失败');
         setState(s); setStatus('等待指令');
-        socket = new WebSocket(API.replace('http', 'ws') + `/ws/sessions/${s.session_id}`);
-        socket.onmessage = e => { const d = JSON.parse(e.data); if (d.type === 'state') setState(d.state); };
       } catch (error) {
         const message = error instanceof DOMException && error.name === 'AbortError' ? '连接后端超时' : error instanceof Error ? error.message : '无法连接后端';
         setStartupError(`${message}（${API}）`); setStatus('后端连接失败');
       } finally { window.clearTimeout(timeout); }
     })();
-    return () => { controller.abort(); socket?.close(); window.clearTimeout(timeout); };
+    return () => { controller.abort(); window.clearTimeout(timeout); };
   }, []);
-
-  useEffect(() => {
-    if (!state || state.navigation.status !== 'active') return;
-    const tick = async () => {
-      if (advancing.current) return;
-      advancing.current = true;
-      try {
-        const response = await fetch(`${API}/api/sessions/${state.session_id}/navigation/advance`, {method: 'POST'});
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.detail || '导航模拟失败');
-        setState(data);
-      } catch (error) { setStatus(`导航模拟失败：${error instanceof Error ? error.message : '未知错误'}`); }
-      finally { advancing.current = false; }
-    };
-    void tick();
-    const timer = window.setInterval(tick, 1000);
-    return () => window.clearInterval(timer);
-  }, [state?.session_id, state?.navigation.status]);
 
   if (!state) return <main className="loading"><div><b>CabinGuard 正在启动…</b>{startupError && <p>启动失败：{startupError}</p>}</div></main>;
   const route = state.navigation.route;
@@ -193,7 +189,7 @@ function App() {
         <label>注意力 <output>{Math.round(state.driver.attention_level * 100)}%</output><input type="range" min="0" max="1" step=".01" value={state.driver.attention_level} onChange={e => updateDriver('attention_level', +e.target.value)} /></label>
         <div className="scenario-grid"><button onClick={() => scenario('commute')}>正常通勤</button><button onClick={() => scenario('rainy')}>雨天出行</button><button className="danger" onClick={() => scenario('fatigue')}>疲劳驾驶</button></div>
       </aside>
-      <section className="center"><div className="map panel"><AmapRoute state={state} onParkPosition={setParkPosition}/><div className="map-top"><span>当前路线</span><b>{state.navigation.status === 'active' ? `导航中 · ${state.navigation.simulated_speed_kmh.toFixed(1)} km/h` : '停车状态：点击地图设置位置'}</b></div>{!import.meta.env.VITE_AMAP_JS_KEY && <div className="road"><span className="pin start">●</span><div className="route-line" style={{width: route ? `${Math.max(14, 100 - state.navigation.progress * 75)}%` : '0%'}} /><span className="car" style={{left: `${8 + state.navigation.progress * 70}%`}}>▰</span><span className="pin end">★</span></div>}{route ? <div className="route-info"><b>{route.distance_km} km</b><span>预计 {route.duration_minutes} 分钟 · 剩余 {state.navigation.remaining_distance_km ?? route.distance_km} km</span></div> : <p>停车时可点击地图设置车辆位置，然后说“带我去虹桥站”</p>}</div>
+      <section className="center"><div className="map panel"><AmapRoute state={state} onParkPosition={setParkPosition}/><div className="map-top"><span>当前路线</span><b>{state.navigation.status === 'active' ? '导航已开始' : '停车状态：点击地图设置位置'}</b></div>{!import.meta.env.VITE_AMAP_JS_KEY && <div className="road"><span className="pin start">●</span><div className="route-line" style={{width: route ? '100%' : '0%'}} /><span className="car" style={{left: '8%'}}>▰</span><span className="pin end">★</span></div>}{route ? <div className="route-info"><b>{route.distance_km} km</b><span>预计 {route.duration_minutes} 分钟</span>{state.navigation.status !== 'idle' && <button onClick={cancelNavigation}>结束导航并清除路线</button>}</div> : <p>停车时可点击地图设置车辆位置，然后说“带我去虹桥站”</p>}</div>
         <div className="cabin-cards"><Card icon="♨" label="空调" value={`${state.cabin.temperature}℃ · ${state.cabin.climate_mode}`} /><Card icon="♫" label="媒体" value={`${state.cabin.media_mode} · ${state.cabin.volume}%`} /><Card icon="▧" label="座椅" value={`通风 ${state.cabin.seat_ventilation} · 按摩 ${state.cabin.seat_massage}`} />{state.weather && <Card icon="☂" label="天气" value={`${state.weather.temperature}℃ · ${state.weather.weather}`} />}</div>
         {state.active_alert && <div className="alert">⚠ {state.active_alert}</div>}
       </section>

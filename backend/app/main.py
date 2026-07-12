@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .agent import handle_message
 from .config import settings
-from .engine import proactive_check
+from .engine import execute_tool, proactive_check
 from .schemas import MessageIn, SimulationPatch
 from .store import store
 
@@ -177,9 +177,23 @@ async def advance_navigation(session_id: str):
         state.vehicle.speed_kmh = 0
         state.driver.driving_duration_minutes = 0
         state.navigation.simulated_speed_kmh = 0
+        state.navigation.route = None
+        state.navigation.destination = None
+        state.navigation.candidates = []
+        state.navigation.progress = 0
+        state.navigation.remaining_distance_km = 0
+        state.navigation.simulated_elapsed_minutes = 0
         state.active_alert = "已到达目的地，车辆已停车，本次驾驶时长已清零。"
     asyncio.create_task(hub.publish(session_id))
     return state.model_dump(mode="json")
+
+
+@app.post("/api/sessions/{session_id}/navigation/cancel")
+async def cancel_navigation(session_id: str):
+    state = state_or_404(session_id)
+    response = await execute_tool(state, "navigation_service", {"action": "cancel"})
+    asyncio.create_task(hub.publish(session_id))
+    return {"response": response, "state": state.model_dump(mode="json")}
 
 
 @app.websocket("/ws/sessions/{session_id}")

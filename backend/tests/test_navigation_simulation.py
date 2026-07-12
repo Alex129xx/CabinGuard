@@ -18,5 +18,7 @@ async def test_navigation_advances_in_real_time_and_stops_at_destination():
     state.navigation.remaining_distance_km = 0.001
     result = await advance_navigation(state.session_id)
     assert result["navigation"]["status"] == "idle"
+    assert result["navigation"]["route"] is None
+    assert result["navigation"]["destination"] is None
     assert result["vehicle"]["speed_kmh"] == 0
     assert result["driver"]["driving_duration_minutes"] == 0
