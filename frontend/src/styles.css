@@ -1,5 +1,6 @@
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600;700&display=swap');
 .text-mode{align-self:center;white-space:nowrap;color:#94b3bb;font-size:12px}
+.service-status{margin-top:10px;color:#94b3bb}
 .amap-canvas{position:absolute;inset:0;z-index:0}.map:has(.amap-canvas):before{display:none}.map:has(.amap-canvas) .map-top{background:#071217b8;padding:8px;border-radius:8px}.map:has(.amap-canvas) .route-info{position:absolute;left:18px;right:18px;bottom:18px}
 .set-parking{position:absolute;z-index:2;right:18px;top:54px;background:#0d3e47;border-color:#54b9b2}
 .vehicle-marker{display:grid;place-items:center;width:34px;height:34px;border:2px solid #fff;border-radius:50%;background:#1976d2;box-shadow:0 2px 8px #0008;font-size:19px}

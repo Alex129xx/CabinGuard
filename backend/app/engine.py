@@ -3,10 +3,27 @@ from __future__ import annotations
 from uuid import uuid4
 from .safety import evaluate
 from .schemas import GateDecision, PendingAction, SessionState, ToolLog
-from .services import AmapServiceError, driving_route, now_iso, search_poi, weather
+from .services import AmapServiceError, WeatherServiceError, driving_route, geocode_location, now_iso, search_poi, weather
 
 
 async def execute_tool(state: SessionState, tool: str, args: dict, proactive: bool = False, skip_gate: bool = False) -> str:
+    aliases = {
+        "search_poi": ("navigation_service", {"action": "search", "destination": args.get("query", args.get("destination", ""))}),
+        "plan_route": ("navigation_service", {"action": "preview", "destination": args.get("destination")}),
+        "start_navigation": ("navigation_service", {"action": "start"}),
+        "stop_navigation": ("navigation_service", {"action": "cancel"}),
+        "set_temperature": ("climate_control", args),
+        "set_seat": ("seat_control", args),
+        "set_media": ("media_control", args),
+        "get_weather": ("weather_service", args),
+        "emit_safety_alert": ("safety_service", args),
+    }
+    if tool == "set_window":
+        state.cabin.window_open_percent = max(0, min(100, int(args.get("open_percent", 0))))
+        return f"车窗已调整为开启 {state.cabin.window_open_percent}%。"
+    if tool == "get_vehicle_status":
+        return f"当前车速 {state.vehicle.speed_kmh:.1f} km/h，驾驶时长 {state.driver.driving_duration_minutes:.1f} 分钟。"
+    tool, args = aliases.get(tool, (tool, args))
     gate = evaluate(tool, args, state, proactive) if not skip_gate else None
     decision = gate.decision if gate else GateDecision.ALLOW
     effective = gate.args if gate else args
@@ -20,9 +37,22 @@ async def execute_tool(state: SessionState, tool: str, args: dict, proactive: bo
         return f"{message}"
 
     if tool == "weather_service":
-        target = state.navigation.destination if effective.get("action") == "destination" and state.navigation.destination else {"lat": state.vehicle.latitude, "lng": state.vehicle.longitude, "name": "当前位置"}
-        state.weather = await weather(target["lat"], target["lng"])
-        return f"{target.get('name', '当前位置')} {state.weather['temperature']}℃，{state.weather['weather']}，降水概率 {state.weather['precipitation_probability']}%。"
+        try:
+            if effective.get("location"):
+                target = await geocode_location(str(effective["location"]))
+            elif effective.get("action") == "destination" and state.navigation.destination:
+                target = state.navigation.destination
+            else:
+                target = {"lat": state.vehicle.latitude, "lng": state.vehicle.longitude, "name": "当前位置"}
+            state.weather = {**await weather(target["lat"], target["lng"]), "location": target.get("name", "当前位置")}
+        except WeatherServiceError as exc:
+            return str(exc)
+        reply = f"{target.get('name', '当前位置')} {state.weather['temperature']}℃，{state.weather['weather']}，降水概率 {state.weather['precipitation_probability']}%。"
+        if effective.get("rainy_scenario") and ("雨" in state.weather["weather"] or state.weather["precipitation_probability"] >= 60):
+            state.vehicle.wiper_on = True
+            state.active_alert = "当前有降雨风险，请注意带伞，已为您打开雨刷。"
+            reply += " 当前有降雨风险，请注意带伞，已为您打开雨刷。"
+        return reply
     if tool == "navigation_service":
         action = effective.get("action")
         if action == "search":
@@ -59,18 +89,33 @@ async def execute_tool(state: SessionState, tool: str, args: dict, proactive: bo
             return f"导航已开始，预计 {state.navigation.route['duration_minutes']} 分钟到达。"
         if action == "cancel":
             state.navigation.status = "idle"; state.navigation.route = None; state.navigation.destination = None
+            state.navigation.candidates = []
             state.navigation.progress = 0; state.navigation.remaining_distance_km = 0; state.navigation.simulated_speed_kmh = 0; state.navigation.simulated_elapsed_minutes = 0
             state.vehicle.speed_kmh = 0; state.driver.driving_duration_minutes = 0
             return "已取消导航。"
     if tool == "climate_control":
-        state.cabin.temperature = int(effective.get("temperature", state.cabin.temperature)); state.cabin.climate_mode = effective.get("mode", state.cabin.climate_mode)
+        mode = effective.get("mode", state.cabin.climate_mode)
+        state.cabin.climate_mode = mode
+        if mode == "off":
+            try:
+                outside = await weather(state.vehicle.latitude, state.vehicle.longitude)
+                state.cabin.temperature = int(outside["temperature"])
+                state.weather = {**outside, "location": "当前位置"}
+                reply = f"空调已关闭，座舱温度已同步当前室外 {state.cabin.temperature}℃。"
+                if state.cabin.temperature < 18 or state.cabin.temperature > 28:
+                    state.active_alert = "当前室外温度不在舒适范围内，是否为您开启空调并自动调节到 23℃？"
+                    reply += " 当前室外温度不在舒适范围内，是否为您开启空调并自动调节到 23℃？"
+                return reply
+            except WeatherServiceError:
+                return "空调已关闭；当前无法获取室外温度，座舱温度保持不变。"
+        state.cabin.temperature = int(effective.get("temperature", state.cabin.temperature))
         return f"已将座舱温度调至 {state.cabin.temperature}℃，模式为 {state.cabin.climate_mode}。"
     if tool == "media_control":
         state.cabin.media_mode = effective.get("mode", state.cabin.media_mode); state.cabin.volume = int(effective.get("volume", state.cabin.volume))
         return f"媒体已切换为{state.cabin.media_mode}，音量 {state.cabin.volume}。"
     if tool == "seat_control":
-        state.cabin.seat_heating = int(effective.get("heating", state.cabin.seat_heating)); state.cabin.seat_ventilation = int(effective.get("ventilation", state.cabin.seat_ventilation)); state.cabin.seat_massage = int(effective.get("massage", state.cabin.seat_massage))
-        return f"座椅已更新：加热 {state.cabin.seat_heating} 档，通风 {state.cabin.seat_ventilation} 档，按摩 {state.cabin.seat_massage} 档。"
+        state.cabin.seat_heating = int(effective.get("heating", state.cabin.seat_heating)); state.cabin.seat_massage = int(effective.get("massage", state.cabin.seat_massage)); state.cabin.seat_ventilation = 0
+        return f"座椅已更新：加热 {state.cabin.seat_heating} 档，按摩 {state.cabin.seat_massage} 档。"
     if tool == "safety_service":
         state.active_alert = effective.get("message", "请注意驾驶安全。")
         return state.active_alert
