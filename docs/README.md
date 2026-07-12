@@ -23,3 +23,5 @@ cd frontend && npm run dev
 - 点击“疲劳驾驶”，再说“我太困了，放个电影，把按摩开到最大”。
 
 当 Azure、高德或天气服务不可用时，系统自动保留键盘输入、浏览器 TTS 和演示 fixture，确保核心场景仍可运行。
+
+DeepSeek 默认直连官方 API，不使用系统代理。只有 WSL 中的代理本身可用时，才在 `.env` 设置 `DEEPSEEK_USE_ENV_PROXY=true`。

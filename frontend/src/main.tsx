@@ -3,6 +3,7 @@ import {createRoot} from 'react-dom/client';
 import './styles.css';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const VOICE_ENABLED = false;
 type State = any;
 
 declare global { interface Window { AMap?: any; _AMapSecurityConfig?: {securityJsCode: string} } }
@@ -33,32 +34,38 @@ function App() {
   const [state, setState] = useState<State | null>(null);
   const [input, setInput] = useState('');
   const [status, setStatus] = useState('正在连接');
+  const [startupError, setStartupError] = useState('');
   const [recording, setRecording] = useState(false);
   const recorder = useRef<MediaRecorder | null>(null);
   const chunks = useRef<Blob[]>([]);
 
   const send = async (text: string) => {
     if (!state || !text.trim()) return;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 20_000);
     try {
       setStatus('Agent 正在处理');
-      const r = await fetch(`${API}/api/sessions/${state.session_id}/messages`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text})});
+      const r = await fetch(`${API}/api/sessions/${state.session_id}/messages`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text}), signal: controller.signal});
       const data = await r.json();
       if (!r.ok) throw new Error(data.detail || 'Agent 请求失败');
-      setState(data.state); setInput(''); setStatus('正在播报'); void speak(data.response); setTimeout(() => setStatus('等待指令'), 600);
-    } catch (error) { setStatus(`发送失败：${error instanceof Error ? error.message : '请检查后端服务'}`); }
+      setState(data.state); setInput(''); setStatus('等待指令');
+    } catch (error) {
+      const message = error instanceof DOMException && error.name === 'AbortError' ? 'Agent 响应超时，请检查后端或 DeepSeek 网络' : error instanceof Error ? error.message : '请检查后端服务';
+      setStatus(`发送失败：${message}`);
+    } finally { window.clearTimeout(timeout); }
   };
 
   const scenario = async (id: string) => {
     if (!state) return;
     const r = await fetch(`${API}/api/sessions/${state.session_id}/scenarios/${id}`, {method: 'POST'});
-    const data = await r.json(); setState(data.state); data.messages?.forEach((m: string) => speak(m));
+    const data = await r.json(); setState(data.state);
   };
 
   const updateDriver = async (field: string, value: number) => {
     if (!state) return;
     const driver = {...state.driver, [field]: value};
     const r = await fetch(`${API}/api/sessions/${state.session_id}/simulation`, {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({driver})});
-    const data = await r.json(); setState(data.state); data.messages?.forEach((m: string) => speak(m));
+    const data = await r.json(); setState(data.state);
   };
 
   const startRecording = async () => {
@@ -86,13 +93,27 @@ function App() {
   };
   const stopRecording = () => { recorder.current?.stop(); setRecording(false); };
 
-  useEffect(() => { (async () => {
-    const r = await fetch(`${API}/api/sessions`, {method: 'POST'}); const s = await r.json(); setState(s); setStatus('等待指令');
-    const ws = new WebSocket(API.replace('http', 'ws') + `/ws/sessions/${s.session_id}`); ws.onmessage = e => { const d = JSON.parse(e.data); if (d.type === 'state') setState(d.state); };
-    return () => ws.close();
-  })(); }, []);
+  useEffect(() => {
+    let socket: WebSocket | undefined;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 8_000);
+    (async () => {
+      try {
+        const r = await fetch(`${API}/api/sessions`, {method: 'POST', signal: controller.signal});
+        const s = await r.json();
+        if (!r.ok) throw new Error(s.detail || '创建会话失败');
+        setState(s); setStatus('等待指令');
+        socket = new WebSocket(API.replace('http', 'ws') + `/ws/sessions/${s.session_id}`);
+        socket.onmessage = e => { const d = JSON.parse(e.data); if (d.type === 'state') setState(d.state); };
+      } catch (error) {
+        const message = error instanceof DOMException && error.name === 'AbortError' ? '连接后端超时' : error instanceof Error ? error.message : '无法连接后端';
+        setStartupError(`${message}（${API}）`); setStatus('后端连接失败');
+      } finally { window.clearTimeout(timeout); }
+    })();
+    return () => { controller.abort(); socket?.close(); window.clearTimeout(timeout); };
+  }, []);
 
-  if (!state) return <main className="loading">CabinGuard 正在启动…</main>;
+  if (!state) return <main className="loading"><div><b>CabinGuard 正在启动…</b>{startupError && <p>启动失败：{startupError}</p>}</div></main>;
   const route = state.navigation.route;
   return <main className="app-shell">
     <header><div><span className="eyebrow">CABINGUARD V2</span><h1>主动式智能座舱</h1></div><div className="status"><i />{status}</div></header>
@@ -108,7 +129,7 @@ function App() {
       </section>
       <aside className="panel agent"><h2>Agent 决策面板</h2><div className="history">{state.messages.map((m: any, i: number) => <div key={i} className={m.role}><small>{m.role === 'user' ? '你' : 'CabinGuard'}</small>{m.content}</div>)}</div>{state.pending_action && <div className="confirm"><b>需要确认</b><p>{state.pending_action.prompt}</p><button onClick={() => send('确认')}>确认执行</button><button onClick={() => send('取消')}>取消</button></div>}<h3>工具与安全日志</h3><div className="logs">{state.tool_logs.map((log: any, i: number) => <div key={i}><b className={log.decision}>{log.decision}</b><span>{log.tool}</span><small>{log.message}</small></div>)}</div></aside>
     </section>
-    <footer><button className={recording ? 'recording' : ''} onClick={recording ? stopRecording : startRecording}>{recording ? '■ 停止录音' : '● 开始说话'}</button><form onSubmit={e => { e.preventDefault(); send(input); }}><input value={input} onChange={e => setInput(e.target.value)} placeholder="例如：带我去虹桥站，顺便看看天气"/><button>发送</button></form><button onClick={() => speechSynthesis.cancel()}>停止播报</button></footer>
+    <footer>{VOICE_ENABLED ? <><button className={recording ? 'recording' : ''} onClick={recording ? stopRecording : startRecording}>{recording ? '■ 停止录音' : '● 开始说话'}</button><button onClick={() => speechSynthesis.cancel()}>停止播报</button></> : <span className="text-mode">纯文字模式：语音输入与播报已暂时关闭</span>}<form onSubmit={e => { e.preventDefault(); send(input); }}><input value={input} onChange={e => setInput(e.target.value)} placeholder="例如：带我去虹桥站，顺便看看天气"/><button>发送</button></form></footer>
   </main>;
 }
 function Metric({label, value}: {label: string, value: string}) { return <div className="metric"><span>{label}</span><b>{value}</b></div>; }

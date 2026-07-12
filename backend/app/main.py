@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import tempfile
+import time
 from pathlib import Path
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,8 +17,15 @@ from .schemas import MessageIn, SimulationPatch
 from .store import store
 
 app = FastAPI(title="CabinGuard V2 API", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+logger = logging.getLogger("cabinguard")
 
 
 class Hub:
@@ -32,9 +41,11 @@ class Hub:
     async def publish(self, session_id: str) -> None:
         state = store.get(session_id)
         if not state: return
+        payload = {"type": "state", "state": state.model_dump(mode="json")}
         dead = []
         for socket in self.connections.get(session_id, []):
-            try: await socket.send_json({"type": "state", "state": state.model_dump(mode="json")})
+            try:
+                await asyncio.wait_for(socket.send_json(payload), timeout=0.5)
             except Exception: dead.append(socket)
         for socket in dead: self.disconnect(session_id, socket)
 
@@ -77,8 +88,14 @@ async def get_state(session_id: str):
 @app.post("/api/sessions/{session_id}/messages")
 async def post_message(session_id: str, payload: MessageIn):
     state = state_or_404(session_id)
-    response = await handle_message(state, payload.text)
-    await hub.publish(session_id)
+    started = time.monotonic()
+    try:
+        response = await asyncio.wait_for(handle_message(state, payload.text), timeout=12)
+    except TimeoutError:
+        logger.warning("message processing timed out for session %s", session_id)
+        raise HTTPException(504, "Agent 处理超时，请重试")
+    asyncio.create_task(hub.publish(session_id))
+    logger.info("message processed in %.2fs for session %s", time.monotonic() - started, session_id)
     return {"response": response, "state": state.model_dump(mode="json")}
 
 
@@ -88,7 +105,7 @@ async def patch_simulation(session_id: str, patch: SimulationPatch):
     if patch.vehicle: state.vehicle = patch.vehicle
     if patch.driver: state.driver = patch.driver
     messages = await proactive_check(state)
-    await hub.publish(session_id)
+    asyncio.create_task(hub.publish(session_id))
     return {"messages": messages, "state": state.model_dump(mode="json")}
 
 
@@ -104,7 +121,7 @@ async def scenario(session_id: str, scenario_id: str):
     else:
         raise HTTPException(404, "未知场景")
     messages = await proactive_check(state)
-    await hub.publish(session_id)
+    asyncio.create_task(hub.publish(session_id))
     return {"messages": messages, "state": state.model_dump(mode="json")}
 
 
@@ -115,7 +132,7 @@ async def advance_navigation(session_id: str):
     state.navigation.progress = min(1, state.navigation.progress + .25)
     if state.navigation.progress >= 1:
         state.navigation.status = "idle"; state.active_alert = "已到达目的地。"
-    await hub.publish(session_id)
+    asyncio.create_task(hub.publish(session_id))
     return state.model_dump(mode="json")
 
 
@@ -124,7 +141,7 @@ async def websocket(session_id: str, socket: WebSocket):
     if not store.get(session_id):
         await socket.close(code=4404); return
     await hub.connect(session_id, socket)
-    await hub.publish(session_id)
+    asyncio.create_task(hub.publish(session_id))
     try:
         while True: await socket.receive_text()
     except WebSocketDisconnect:

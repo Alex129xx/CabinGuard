@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     deepseek_api_key: str | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-v4-flash"
+    deepseek_use_env_proxy: bool = False
     amap_web_service_key: str | None = None
     azure_speech_key: str | None = None
     azure_speech_region: str | None = None

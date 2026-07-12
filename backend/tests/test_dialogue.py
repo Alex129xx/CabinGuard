@@ -44,3 +44,13 @@ async def test_unmatched_candidate_reprompts_without_llm(monkeypatch):
     state.navigation.candidates = [{"name": "上海虹桥站", "address": "", "lat": 31.19, "lng": 121.32}]
     reply = await handle_message(state, "随便一个")
     assert "回复地点全名或序号" in reply
+
+
+@pytest.mark.asyncio
+async def test_greetings_use_deepseek_when_available(monkeypatch):
+    async def deepseek_reply(*_args, **_kwargs):
+        return "您好，我是来自 DeepSeek 的 CabinGuard。"
+    monkeypatch.setattr("app.agent.try_llm_tools", deepseek_reply)
+    state = SessionState(session_id="test")
+    assert "DeepSeek" in await handle_message(state, "你好")
+    assert "DeepSeek" in await handle_message(state, "早上好")

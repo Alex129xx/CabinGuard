@@ -52,7 +52,7 @@ def weather_label(code: int) -> str:
 async def search_poi(query: str) -> list[dict[str, Any]]:
     if settings.amap_enabled:
         try:
-            async with httpx.AsyncClient(timeout=8) as client:
+            async with httpx.AsyncClient(timeout=3) as client:
                 response = await client.get("https://restapi.amap.com/v5/place/text", params={"key": settings.amap_web_service_key, "keywords": query, "city": "上海", "show_fields": "business"})
                 data = response.json()
                 pois = data.get("pois", [])

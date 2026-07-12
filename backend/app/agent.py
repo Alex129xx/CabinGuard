@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
-from openai import AsyncOpenAI
+import httpx
 
 from .config import settings
 from .engine import confirm, execute_tool
@@ -19,6 +20,7 @@ TOOLS = [
 ]
 
 SYSTEM_PROMPT = """你是 CabinGuard 智能座舱助手。使用中文，回答简洁。需要外部数据或车控时必须调用工具；绝不绕过 Safety Gate。导航目的地有歧义时先搜索，不要自行猜测。"""
+logger = logging.getLogger("cabinguard")
 
 
 def normalize_place(value: str) -> str:
@@ -69,6 +71,7 @@ async def handle_message(state: SessionState, text: str) -> str:
             return remember(state, response)
         return remember(state, candidate_prompt(state.navigation.candidates))
 
+    # DeepSeek is the primary reasoning and tool-selection layer for all new turns.
     response = await try_llm_tools(state, text) if settings.llm_enabled else None
     if not response:
         response = await deterministic_response(state, text)
@@ -83,22 +86,36 @@ def remember(state: SessionState, response: str) -> str:
 
 async def try_llm_tools(state: SessionState, text: str) -> str | None:
     try:
-        client = AsyncOpenAI(api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url)
         context = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "system", "content": f"车辆速度 {state.vehicle.speed_kmh}km/h；疲劳 {state.driver.fatigue_level:.2f}；导航状态 {state.navigation.status}。"},
             *state.messages[-8:],
         ]
-        completion = await client.chat.completions.create(model=settings.deepseek_model, messages=context, tools=TOOLS, tool_choice="auto", temperature=0.2)
-        message = completion.choices[0].message
-        if not message.tool_calls:
-            return message.content
+        endpoint = f"{settings.deepseek_base_url.rstrip('/')}/chat/completions"
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(8.0, connect=3.0),
+            trust_env=settings.deepseek_use_env_proxy,
+        ) as client:
+            response = await client.post(endpoint, headers={"Authorization": f"Bearer {settings.deepseek_api_key}"}, json={
+                "model": settings.deepseek_model,
+                "messages": context,
+                "tools": TOOLS,
+                "tool_choice": "auto",
+                "temperature": 0.2,
+            })
+            response.raise_for_status()
+            message = response.json()["choices"][0]["message"]
+        logger.info("DeepSeek completed a turn for session %s", state.session_id)
+        if not message.get("tool_calls"):
+            return message.get("content")
         results = []
-        for call in message.tool_calls:
-            args = json.loads(call.function.arguments or "{}")
-            results.append(await execute_tool(state, call.function.name, args))
+        for call in message["tool_calls"]:
+            function = call["function"]
+            args = json.loads(function.get("arguments") or "{}")
+            results.append(await execute_tool(state, function["name"], args))
         return " ".join(results)
-    except Exception:
+    except Exception as exc:
+        logger.warning("DeepSeek request failed (%s); using local fallback", type(exc).__name__)
         return None
 
 
