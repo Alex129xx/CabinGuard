@@ -1,10 +1,22 @@
 .env
+.env.local
+.env.*.local
+!.env.example
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+*.log
+.coverage
+htmlcov/
+.DS_Store
 frontend/node_modules/
+frontend/.env.local
+frontend/.env.*.local
 frontend/dist/
 backend/data/*.db
 backend/data/*.sqlite
 backend/data/*.db-*
+
+# Local presentation drafts are intentionally not part of the repository.
+docs/PPT*.md

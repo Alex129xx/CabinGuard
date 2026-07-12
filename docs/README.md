@@ -39,7 +39,7 @@ flowchart LR
 | 外部服务 | 高德 Web 服务、Open-Meteo | POI 搜索、驾车路线、实时天气与地理编码 |
 | 持久化 | SQLite、LangGraph Checkpoint | 多轮会话、待确认操作、用户明确偏好 |
 
-更完整的设计复盘、难点和改进计划见 [项目报告.md](项目报告.md)。
+更完整的设计复盘、难点和改进计划见 [project-report.md](project-report.md)。
 
 ## 环境要求
 
@@ -51,7 +51,13 @@ flowchart LR
 
 ## 配置
 
-在项目根目录创建 `.env`（该文件不应提交到 Git）：
+项目已提供可提交的配置模板。先复制模板，再按需填写 Key；真实 `.env` 不应提交到 Git：
+
+```bash
+cp .env.example .env
+```
+
+也可以手动创建 `.env`：
 
 ```dotenv
 # 可选：语义规划。未配置时使用本地规则降级。
@@ -83,9 +89,11 @@ python3 -m venv .venv
 .venv/bin/pip install -r backend/requirements.txt
 
 cd frontend
-npm install
+npm ci
 cd ..
 ```
+
+`package-lock.json` 已纳入版本控制，`npm ci` 会按锁定版本安装前端依赖。Python 依赖目前使用 `backend/requirements.txt` 中的兼容版本范围；如需完全固定 Python 环境，建议在目标部署环境生成并提交经过评审的锁定文件。
 
 开发模式需要两个终端：
 
@@ -144,6 +152,6 @@ frontend/
   src/             React 座舱界面、地图与语音交互
 docs/
   README.md        项目使用说明
-  项目报告.md      项目复盘与后续规划
+  project-report.md 项目复盘与后续规划
   V3计划.md        V3 架构设计与实施规划
 ```
