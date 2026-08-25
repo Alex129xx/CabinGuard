@@ -110,6 +110,21 @@ npm run dev
 
 访问 `http://localhost:5173`。后端健康检查为 `http://localhost:8000/api/health`，FastAPI 接口文档为 `http://localhost:8000/docs`。
 
+如果后端因端口占用等原因改用其他端口（例如 `5001`），启动前端时应同步设置 API 地址：
+
+```bash
+cd frontend
+VITE_API_URL=http://localhost:5001 npm run dev
+```
+
+也可以将该配置写入 `frontend/.env.local`，以后启动时会自动使用：
+
+```dotenv
+VITE_API_URL=http://localhost:5001
+```
+
+修改 `.env.local` 后需重启 Vite。后端端口变化不影响前端的开发端口；请确保后端的 CORS 配置仍包含 `http://localhost:5173`。
+
 ### 演示构建
 
 ```bash
